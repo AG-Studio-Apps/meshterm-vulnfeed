@@ -3,16 +3,16 @@
 The signed host vulnerability feed meshTerm reads for "Security updates" (meshTerm
 `docs/plan-host-cve-scanner.md`). Plain static JSON on GitHub Pages, rebuilt twice a day.
 
-**Stage S1 (this state): curated-only.** The manifest carries the hand-written Tailscale rules and an empty
-`releases` object. The OSV builder (Ubuntu/Debian release files) is S2: its seam is `build_releases()` in
-`builder/build.py`.
+**Stage S2 (this state): curated rules plus OSV release files for dpkg releases.** The manifest carries the
+hand-written Tailscale rules and one release file per Ubuntu / Debian release (`builder/osvfeed.py`). Alpine
+(S4) and the rpm family (S5) come later.
 
 ## Layout
 
 ```
 https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/manifest.json          (+ .minisig, the only signed file)
 https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/curated-<sha256-16>.json
-https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.json   (S2)
+https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.json
 ```
 
 - `curated/curated.json`: the rules, reviewed in pull requests. `curated/curated.schema.json` documents them;
@@ -22,6 +22,10 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   `appliesTo` (`any` or `tailnet`). **The feed never carries a command or a recipe**: any other field is
   refused, so a compromised feed key can only add or hide a finding.
 - `builder/build.py`: writes `out/v1/manifest.json` and the content-addressed files, then gates them.
+- `builder/osvfeed.py`: the OSV release files (rules and gates below); `builder/netfetch.py` its downloads and
+  cache; `builder/dpkgver.py` Debian version comparison; `builder/cvss.py` CVSS 3.x and 4.0 scores.
+- `builder/baselines/debian-<n>.tsv`: release-day source versions, from snapshot.debian.org (`build.py baseline`).
+- `builder/golden/`: the golden fixtures and their expectations (`expected.json`).
 - `builder/manifest.schema.json`: the manifest, as documentation (`check_manifest()` is authoritative).
 - `scripts/sign.py`: local signing and verification (CI does not run it to sign).
 - `keys/`: the two public keys the app pins. See `keys/README.md` for the ids and the Swift snippet.
@@ -33,7 +37,11 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
 
 ```json
 {"schema": 1, "serial": 12, "version": 12, "generated": "2026-11-05T05:10:00Z",
- "sources": {}, "releases": {},
+ "sources": {"osv": {"Debian": "2026-11-05T15:00:06Z", "Ubuntu": "2026-11-05T11:58:23Z"},
+             "archive": {"noble": "2024-04-25T15:10:33Z", "noble-security": "2026-11-05T03:38:05Z", "...": "..."},
+             "baseline": {"ubuntu-24.04": "2024-04-25", "debian-12": "2023-06-10", "...": "..."}},
+ "releases": {"ubuntu-24.04": {"format": "dpkg", "file": "r/ubuntu-24.04-8dcc0c17b45f0405.json",
+                               "sha256": "8dcc0c17...", "bytes": 38955, "rows": 892}, "...": {}},
  "curated": {"file": "curated-25abfc9f67145d28.json", "sha256": "25abfc9f...aa63b"}}
 ```
 
@@ -43,8 +51,54 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   `builds/` commit was lost must never have its serial reused: devices refuse the same serial with other bytes).
 - Every file the manifest names is checked by its sha256. The files of the previous 2 builds are carried
   forward (fetched from the live site and checked against their `builds/` record), so 3 builds stay live.
-- Gate before signing: the manifest's exact shape, canonical bytes, under 16 KB; every named file present and
-  matching its sha256; every file under 600 KB; no unexpected file, no symlink; the curated file re-validates.
+- Gate before signing: the manifest's exact shape, canonical bytes, under 16 KB; release keys on the allowlist and
+  the fixed `sources` shape; every named file present and matching its sha256; every release file's schema;
+  every file under 600 KB; no unexpected file, no symlink; the curated file re-validates.
+
+## Release files (`v1/r/`)
+
+```json
+{"release":"ubuntu-24.04","format":"dpkg","keyedBy":"source",
+ "pkgs":{"apt":[["0","2.8.4ubuntu0.1",3,["CVE-2026-109518"]]]},
+ "kernel":{"linux-aws-6.8":[["0","6.8.0-1040.42~22.04.1",3,57,"2026-10-30"]]}}
+```
+
+A package row is `[introduced, fixed, severity, ids]` (severity 3 High, 4 Critical; ids are the High/Critical
+CVEs fixed there); a kernel row is `[introduced, fixed, maxSeverity, count, publishedDate]`. Keyed by SOURCE
+package: hosts match `${source:Package}` / `${source:Version}`.
+
+Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ubuntu-20.04`, `-22.04`, `-24.04`,
+`-26.04`, `-26.10` (the current interim; 25.10 is end of life), `ubuntu-<lts>-esm` (the `Ubuntu:Pro:<lts>` rows,
+for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`.
+
+**Adding a release** (every Ubuntu interim, every six months; the next is 27.04): add it to `RELEASES` in
+`builder/osvfeed.py` AND to the `allow` set in the sign job of `.github/workflows/build.yml`, in the same pull
+request. `tests/test_workflow.py` fails while the two differ, and the sign job refuses any release not on its
+list. Drop an end-of-life interim the same way. A new Debian release also needs `build.py baseline --release`.
+
+The rules (plan section 3), in order, with every count in the build log:
+
+1. Range shapes: ECOSYSTEM, alternating introduced/fixed. Anything else, or an Ubuntu `availability` we have not
+   seen, is an unknown shape and **fails the build**.
+2. Unfixed rows are dropped. Withdrawn records are skipped. Livepatch, Legacy add-on and BlueField rows never
+   ship; Ubuntu Pro rows go only to the `-esm` files.
+3. Fixed values that are date-shaped or not valid Debian versions are rejected.
+4. **Release-baseline cut**: fixed <= the release-day version is dropped (it never matches a host of that
+   release). Ubuntu: the release pocket (frozen on release day). Debian: `builder/baselines/`.
+5. A surviving fixed value whose leading number matches nothing the source has had is rejected (an ecosystem
+   with 0.5% or more rejected fails the build).
+6. **Published check**: the highest version across every pocket (`<codename>`, `-updates`, `-security`) and
+   component must be >= fixed. ESM rows skip it (the ESM archive needs a subscription token).
+7. Severity per CVE: Ubuntu priority, else CVSS 3.x/4.0, else Medium (Ubuntu); CVSS, else High when a DSA/DLA
+   ships the fix, else Medium (Debian). Only High and Critical ship.
+8. Kernel sources (`linux`, `linux-*` except firmware and the like) fold to counts.
+
+More gates: row counts per release within +-30% (or 25 rows) of the previous build (a first build or a new
+release passes, and says so); each file under 600 KB; the **golden fixtures** in `builder/golden/expected.json`.
+Each golden case counts a row only when its fix date is before the capture date and its fixed version was in the
+archive at capture time (the case's `.archive.tsv`, from snapshot.ubuntu.com / snapshot.debian.org), so a frozen
+host listing never drifts. The intermediates (`--work`, the `intermediates` CI artifact) hold every shipped row
+with its publish date and every dropped row with its reason.
 
 Signature (minisign, prehashed Ed25519), trusted comment exactly:
 
@@ -67,13 +121,18 @@ The floors are set by hand. "Recommended" rules never enter the app's pill; they
 ## Local build
 
 ```sh
-python3 builder/build.py build --commit "$(git rev-parse HEAD)" --out out
+python3 builder/build.py build --commit "$(git rev-parse HEAD)" --out out --cache cache --work work
 python3 scripts/sign.py sign --manifest out/v1/manifest.json --key ~/.config/meshterm-vulnfeed/feed.key \
   --commit "$(git rev-parse HEAD)"
 python3 scripts/sign.py verify --manifest out/v1/manifest.json --role feed --require-commit
 ```
 
-Needs `python3` (stdlib only) and `minisign`. The tests generate throwaway keys and never touch the real ones.
+Needs `python3` (stdlib only) and `minisign`. The tests generate throwaway keys and never touch the real ones, and
+never touch the network. A full build downloads about 900 MB of OSV zips (Ubuntu's is 0.8 GB) and about 100 MB
+of Sources into `--cache`, and takes 3 to 5 minutes; `--offline` re-runs from the cache.
+
+- `build.py baseline --release debian-12` re-generates a Debian baseline (only needed for a new release).
+- `build.py golden-archive` re-generates the golden `.archive.tsv` files (only when a fixture changes).
 
 ## The workflow (`.github/workflows/build.yml`)
 
@@ -81,10 +140,10 @@ Schedule 05:10 and 17:10 UTC, plus `workflow_dispatch`. No pull-request trigger.
 
 | job | permissions | what |
 |---|---|---|
-| build | `contents: read` | tests, builder, gate; uploads the unsigned site and the build record |
-| sign | `contents: read`, `actions: read`; environment `vulnfeed-signing` | inline shell only (no repository script): checks the environment is main-only, re-checks the artifact against the committed curated file, signs with `VULNFEED_MINISIGN_KEY`, verifies |
+| build | `contents: read` | tests, builder, gate; the OSV/archive download cache (`actions/cache`, keyed by its contents); uploads the unsigned site, the build record and the intermediates |
+| sign | `contents: read`, `actions: read`; environment `vulnfeed-signing` | inline shell and `python3 -I` only (no repository script): checks the environment is main-only, re-checks the artifact (the committed curated file; every release entry names an existing `v1/r/<allowlisted release>-<16hex>.json` with matching sha256 and bytes; the fixed `sources` shape; no other files), signs with `VULNFEED_MINISIGN_KEY`, verifies |
 | deploy | `pages: write`, `id-token: write` | `actions/deploy-pages` |
-| smoke | `contents: read` | fetches the live pair and verifies it (CDN lag is a warning) |
+| smoke | `contents: read` | fetches the live pair and verifies it, then each release file's sha256 (CDN lag is a warning) |
 | record | `contents: write` | commits `builds/<serial>.json` to main (history, and repo activity so GitHub keeps the schedule) |
 
 Every action is pinned by commit SHA (the ones meshterm-recipes uses).
@@ -140,7 +199,6 @@ UTC.
 
 ## TODO
 
-- S2: the OSV builder in `build_releases()`, with its gates (row counts +-30%, rejected versions under 0.5%,
-  unknown range shapes = 0, the golden fixtures), and the sign job's `releases` check (it refuses a non-empty
-  `releases` today).
+- S4 (Alpine) and S5 (rpm) release files; the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
+  allowlist when it ships.
 - An emergency publish path in the workflow (a committed `manifest.json.minisig` mode, as in meshterm-recipes).
