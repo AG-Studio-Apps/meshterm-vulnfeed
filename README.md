@@ -26,6 +26,8 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   cache; `builder/dpkgver.py` Debian version comparison; `builder/cvss.py` CVSS 3.x and 4.0 scores.
 - `builder/baselines/debian-<n>.tsv`: release-day source versions, from snapshot.debian.org (`build.py baseline`).
 - `builder/golden/`: the golden fixtures and their expectations (`expected.json`).
+- `gates/`: the committed row-count minimums and reviewed overrides.
+- `keys/archive/`: the Ubuntu and Debian archive keyrings the builder verifies InRelease files with.
 - `builder/manifest.schema.json`: the manifest, as documentation (`check_manifest()` is authoritative).
 - `scripts/sign.py`: local signing and verification (CI does not run it to sign).
 - `keys/`: the two public keys the app pins. See `keys/README.md` for the ids and the Swift snippet.
@@ -71,34 +73,74 @@ Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ub
 `-26.04`, `-26.10` (the current interim; 25.10 is end of life), `ubuntu-<lts>-esm` (the `Ubuntu:Pro:<lts>` rows,
 for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`.
 
-**Adding a release** (every Ubuntu interim, every six months; the next is 27.04): add it to `RELEASES` in
-`builder/osvfeed.py` AND to the `allow` set in the sign job of `.github/workflows/build.yml`, in the same pull
-request. `tests/test_workflow.py` fails while the two differ, and the sign job refuses any release not on its
-list. Drop an end-of-life interim the same way. A new Debian release also needs `build.py baseline --release`.
+**Adding a release** (every Ubuntu interim, every six months; the next is 27.04), in one pull request:
+
+1. Add it to `RELEASES` in `builder/osvfeed.py` and to the `allow` set in the sign job of
+   `.github/workflows/build.yml` (`tests/test_workflow.py` fails while the two differ).
+2. Give it a minimum in `gates/minimums.json` (the build refuses a release without one). Its first build has no
+   previous count, so that minimum is its only row floor.
+3. A new Debian release also needs `build.py baseline --release <key>`.
+
+**Dropping a release** (an end-of-life interim), in one pull request:
+
+1. Remove it from `RELEASES`, from the sign job's `allow` set and from `gates/minimums.json`.
+2. Add it to `RETIRED_RELEASES` in `builder/osvfeed.py` and to the sign job's `retired` set (the test keeps the
+   two equal). Without this the build fails: a release missing from the previous build's manifest must be
+   either built or retired, so one cannot vanish by mistake.
+3. The next build publishes no entry for it. Its last file stays on Pages only as a carry-over of the two builds
+   before (the sign job allows a retired release's files only when a `builds/` record names them with that
+   sha256), then ages out. Once a build has published without it, it can be removed from both retired lists.
+
+`tests/test_workflow.py` (`test_retiring_a_release_end_to_end`) runs these steps against the sign job's check.
 
 The rules (plan section 3), in order, with every count in the build log:
 
 1. Range shapes: ECOSYSTEM, alternating introduced/fixed. Anything else, or an Ubuntu `availability` we have not
-   seen, is an unknown shape and **fails the build**.
+   seen, is an unknown shape and **fails that release** (see fail-soft below).
 2. Unfixed rows are dropped. Withdrawn records are skipped. Livepatch, Legacy add-on and BlueField rows never
    ship; Ubuntu Pro rows go only to the `-esm` files.
 3. Fixed values that are date-shaped or not valid Debian versions are rejected.
 4. **Release-baseline cut**: fixed <= the release-day version is dropped (it never matches a host of that
    release). Ubuntu: the release pocket (frozen on release day). Debian: `builder/baselines/`.
 5. A surviving fixed value whose leading number matches nothing the source has had is rejected (an ecosystem
-   with 0.5% or more rejected fails the build).
+   with 0.5% or more rejected fails all its releases).
 6. **Published check**: the highest version across every pocket (`<codename>`, `-updates`, `-security`) and
-   component must be >= fixed. ESM rows skip it (the ESM archive needs a subscription token).
-7. Severity per CVE: Ubuntu priority, else CVSS 3.x/4.0, else Medium (Ubuntu); CVSS, else High when a DSA/DLA
-   ships the fix, else Medium (Debian). Only High and Critical ship.
+   component must be >= fixed. ESM rows skip it (the ESM archive needs a subscription token). Each suite's
+   `InRelease` must carry at least one valid signature from the distro keyring pinned in `keys/archive/`, and no
+   bad one (checked with `gpgv`, apt's rule), before any of its Sources digests is trusted. An archive version
+   our strict parser refuses is skipped and counted.
+7. Severity per CVE: the package's own Ubuntu priority, else the record's, else CVSS 3.x/4.0, else Medium
+   (Ubuntu); CVSS, else High when a DSA/DLA naming that CVE ships the fix, else Medium (Debian). Only High and
+   Critical ship.
 8. Kernel sources (`linux`, `linux-*` except firmware and the like) fold to counts.
 
-More gates: row counts per release within +-30% (or 25 rows) of the previous build (a first build or a new
-release passes, and says so); each file under 600 KB; the **golden fixtures** in `builder/golden/expected.json`.
-Each golden case counts a row only when its fix date is before the capture date and its fixed version was in the
-archive at capture time (the case's `.archive.tsv`, from snapshot.ubuntu.com / snapshot.debian.org), so a frozen
-host listing never drifts. The intermediates (`--work`, the `intermediates` CI artifact) hold every shipped row
-with its publish date and every dropped row with its reason.
+More gates, per release:
+
+- **Row counts** (`row_gate`): at least `max(gates/minimums.json, half the previous count)`, and within +-30% (or
+  25 rows) of the previous build. A reviewed exception is an entry in `gates/overrides.json` (`release`, `min`,
+  `max`, `expires`, `reason`): while unexpired it replaces both rules with `[min, max]`; expired entries are
+  ignored. Adding one is a commit on main, which is the review.
+- Each file under 600 KB, and its schema (`check_release_body`).
+- The **golden fixtures** in `builder/golden/expected.json`: stock `ubuntu:24.04` and `debian:12` images and a
+  June 2023 `debian:12.0`. A case counts a row only when its fix date is before the capture date and its fixed
+  version was in the archive at capture time (the case's `.archive.tsv`, from snapshot.ubuntu.com /
+  snapshot.debian.org). Errors: an expected source not flagged (a regression that drops a real fix), or a hit on
+  a source the frozen archive does not list. An EXTRA hit on an `exact` case is a warning: every counted row is
+  already pinned to the archive at capture, so an extra one can only come from OSV re-rating an old CVE (the
+  stock images carry pending Medium fixes, such as pcre2, that could become High) or adding ids. Freezing
+  severities and ids instead would stop the gate from noticing a re-rated row that the builder then drops.
+
+The intermediates (`--work`, the `intermediates` CI artifact) hold every shipped row with its publish date and
+every dropped row with its reason.
+
+**Fail-soft.** The curated rules must keep refreshing (the app hides every finding from a feed older than 7
+days), so no S2 problem stops a build. A release whose archive, OSV zip or gates fail is not rebuilt: the
+manifest carries forward its last published entry (same file, sha256, bytes and rows, from the newest `builds/`
+record that names it, the file re-fetched from the live site and checked), and the UNSIGNED build record gets
+`stale: {release: {since, reason}}` (`since` is when it first failed). The manifest format is unchanged. If the
+whole S2 step fails, every release is carried forward. A release with nothing to carry is left out, and the
+record says `omitted`. Only a broken committed configuration (`gates/`, a missing baseline, a release dropped
+without being retired) and an invalid curated file still fail the build.
 
 Signature (minisign, prehashed Ed25519), trusted comment exactly:
 
@@ -180,8 +222,11 @@ Every action is pinned by commit SHA (the ones meshterm-recipes uses).
 `check.py` fetches `v1/manifest.json` and `.minisig` from the live site, verifies them against the installed
 copy of `keys/`, checks the curated file's sha256, and files ONE issue in the private `AG-Studio-Apps/meshTerm`
 (label `vulnfeed`) when `generated` is more than 24 hours old, the pair does not verify, or a file is missing.
-It comments again only when the problem changes or once a day, flags an emergency-key signature, and closes
-the issue when the feed recovers. Dry run unless `VULNFEED_ALERT_DRY_RUN=0`. The timer runs at 06:40 and 18:40
+It also reads the build record of the live serial as COMMITTED on main (`builds/<serial>.json` on
+raw.githubusercontent.com; committed, not published, because the record is unsigned and the sign job allows no
+extra files on Pages) and reports `stale-release` when any release has been carried forward for more than 48 h,
+or `fetch-record` when that record is missing. It comments again only when the problem changes or once a day,
+flags an emergency-key signature, and closes the issue when the feed recovers. Dry run unless `VULNFEED_ALERT_DRY_RUN=0`. The timer runs at 06:40 and 18:40
 UTC.
 
 ## Keys and incidents
@@ -201,4 +246,6 @@ UTC.
 
 - S4 (Alpine) and S5 (rpm) release files; the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
   allowlist when it ships.
+- InRelease `Valid-Until` is not enforced (snapshot files are long expired): a replayed old, validly signed
+  InRelease could make fresh fixes look unpublished until the next build. The row-count gates bound the damage.
 - An emergency publish path in the workflow (a committed `manifest.json.minisig` mode, as in meshterm-recipes).
