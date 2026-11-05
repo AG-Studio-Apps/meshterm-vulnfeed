@@ -1,0 +1,415 @@
+# Builds the host vulnerability feed, signs v1/manifest.json with the unattended feed key and deploys it to
+# GitHub Pages, twice a day. Modelled on meshterm-recipes' publish.yml, with the plan's HIGH 5 hardening
+# (meshTerm docs/plan-host-cve-scanner.md 4.2):
+#
+#   build   no secrets. Runs the tests and builder/build.py (serial = builds/ history, floored by the live
+#           serial), gates the site and uploads it UNSIGNED, with the build record.
+#   sign    environment `vulnfeed-signing` (deployments limited to main; NO required reviewer: it is
+#           unattended). Runs NO repository script, only the inline shell below: checks the environment is
+#           still main-only, re-checks the artifact against the committed curated file, signs with
+#           VULNFEED_MINISIGN_KEY, verifies, uploads the Pages artifact.
+#   deploy  actions/deploy-pages.
+#   smoke   no secrets, no repository script: fetches the live pair and verifies it.
+#   record  commits builds/<serial>.json (the manifest and the build log) to main: a history, and the repo
+#           activity that stops GitHub disabling this schedule after 60 quiet days. Runs no repository script.
+#
+# Trusted comment (meshDeckShared SignedArtifactContract(label: "vulnfeed", kind: "host-vulns"); `version=` is
+# the second token):
+#
+#   vulnfeed=host-vulns version=<serial> date=<YYYY-MM-DD> commit=<sha>
+#
+# No pull_request / pull_request_target trigger, ever. Every action is pinned by commit SHA (the SHAs
+# meshterm-recipes' publish.yml uses). `permissions: {}` by default; each job names its minimum.
+#
+# Key rotation touches FOUR places that must move together: keys/vulnfeed-<role>.pub, the key ids below, the
+# freshness alert's installed keys (alert/install.sh copies keys/), and the app's pinned keys (VulnFeedTrust).
+name: Build vulnfeed
+
+on:
+  schedule:
+    - cron: "10 5 * * *"
+    - cron: "10 17 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: vulnfeed-pages
+  cancel-in-progress: false
+
+env:
+  SITE_URL: https://ag-studio-apps.github.io/meshterm-vulnfeed
+  FEED_KEY_ID: 965BA616AC0D4DFC
+  EMERGENCY_KEY_ID: 299EE7D96076CF7D
+
+jobs:
+  build:
+    name: Build and gate
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      serial: ${{ steps.meta.outputs.serial }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          minisign -v
+
+      - name: Check the public keys are the pinned ones
+        run: |
+          set -euo pipefail
+          for pair in "feed:$FEED_KEY_ID" "emergency:$EMERGENCY_KEY_ID"; do
+            role=${pair%%:*}; want=${pair#*:}
+            got=$(python3 -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
+            [ "$got" = "$want" ] || { echo "::error::keys/vulnfeed-$role.pub has key id $got, the workflow pins $want"; exit 1; }
+          done
+
+      - name: Tests
+        run: python3 -m unittest discover -s tests -t tests -v
+
+      # The live manifest is only a serial FLOOR here (build.py refuses one far above builds/), so it is not
+      # verified first. A 404 is the first publish; any other failure stops the run, because the serial could
+      # otherwise repeat with different bytes, which every device refuses.
+      - name: Fetch the live manifest (serial floor)
+        id: live
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o "$RUNNER_TEMP/live-manifest.json" -w '%{http_code}' --max-time 30 \
+                   -H 'Cache-Control: no-cache' "$SITE_URL/v1/manifest.json?r=$(date +%s)$RANDOM" || true)
+          case "$code" in
+            200) echo "args=--live-manifest $RUNNER_TEMP/live-manifest.json" >> "$GITHUB_OUTPUT" ;;
+            404)
+              if ls builds/*.json >/dev/null 2>&1; then
+                echo "::warning::the live manifest is 404 but builds/ has history; building from builds/ alone"
+              fi
+              echo "args=" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::cannot fetch the live manifest (HTTP $code); the last good feed stays live"; exit 1 ;;
+          esac
+
+      - name: Build and gate
+        env:
+          LIVE_ARGS: ${{ steps.live.outputs.args }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          python3 builder/build.py build --commit "$GITHUB_SHA" --out out --record record/build.json \
+            --carry-base "$SITE_URL" $LIVE_ARGS
+          python3 builder/build.py gate --out out
+
+      - name: Read the serial and date
+        id: meta
+        run: |
+          set -euo pipefail
+          read -r serial date < <(python3 -c 'import json; m = json.load(open("out/v1/manifest.json")); print(m["serial"], m["generated"][:10])')
+          echo "serial=$serial" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
+          { echo "### vulnfeed serial $serial ($date)"; echo; echo '```json'; cat out/v1/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pack the site for signing
+        run: tar -C out -cf "$RUNNER_TEMP/site.tar" .
+
+      - name: Upload the site for signing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: site-unsigned
+          path: ${{ runner.temp }}/site.tar
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload the build record
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-record
+          path: record/build.json
+          retention-days: 7
+          if-no-files-found: error
+
+  sign:
+    name: Sign the manifest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: vulnfeed-signing
+    permissions:
+      contents: read
+      actions: read
+    env:
+      SERIAL: ${{ needs.build.outputs.serial }}
+      DATE: ${{ needs.build.outputs.date }}
+    steps:
+      # Fails closed when the environment no longer limits deployments to main alone. No reviewer check: this
+      # key is unattended by design (plan D2).
+      - name: Check the environment is still main-only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api() {
+            gh api "$1" 2>/dev/null \
+              || curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"
+          }
+          ENV_JSON=$(api "repos/$GITHUB_REPOSITORY/environments/vulnfeed-signing")
+          POLICIES_JSON=$(api "repos/$GITHUB_REPOSITORY/environments/vulnfeed-signing/deployment-branch-policies")
+          export ENV_JSON POLICIES_JSON
+          python3 - <<'PY'
+          import json, os, sys
+          env = json.loads(os.environ["ENV_JSON"])
+          policies = json.loads(os.environ["POLICIES_JSON"])
+          names = sorted(f"{p.get('type')}:{p.get('name')}" for p in policies.get("branch_policies") or [])
+          if not (env.get("deployment_branch_policy") or {}).get("custom_branch_policies") or names != ["branch:main"]:
+              print(f"::error::Refusing to sign: vulnfeed-signing does not limit deployments to main alone "
+                    f"({', '.join(names) or 'no branch policy'}). Fix it in Settings > Environments, then re-run.")
+              sys.exit(1)
+          print("vulnfeed-signing: deployments limited to main.")
+          PY
+
+      # Only the committed curated file and the public keys: no scripts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /curated/curated.json
+            /keys/
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: site-unsigned
+          path: ${{ runner.temp }}/in
+
+      # The build job ran repository code, so its tarball is untrusted input here: regular files and directories
+      # only, unpacked outside the checkout, and every file accounted for.
+      - name: Unpack and check the artifact against the commit
+        run: |
+          set -euo pipefail
+          bad=$(tar -tvf "$RUNNER_TEMP/in/site.tar" | grep -v '^[-d]' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::the build artifact holds entries that are not regular files or directories"
+            printf '%s\n' "$bad" | head -20
+            exit 1
+          fi
+          site="$RUNNER_TEMP/site"
+          rm -rf "$site"
+          mkdir "$site"
+          tar -C "$site" --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/in/site.tar"
+          left=$(find "$site" ! -type f ! -type d | head -5)
+          [ -z "$left" ] || { echo "::error::unexpected entries after unpacking: $left"; exit 1; }
+          export SITE="$site"
+          python3 - <<'PY'
+          import hashlib, json, os, re, sys
+          site, serial, date = os.environ["SITE"], int(os.environ["SERIAL"]), os.environ["DATE"]
+          def pairs(items):
+              keys = [k for k, _ in items]
+              if len(set(keys)) != len(keys):
+                  sys.exit("::error::manifest.json has a duplicate key")
+              return dict(items)
+          raw = open(os.path.join(site, "v1", "manifest.json"), "rb").read()
+          if len(raw) > 16 * 1024:
+              sys.exit("::error::manifest.json is over 16 KB")
+          m = json.loads(raw, object_pairs_hook=pairs)
+          want = {"schema", "version", "serial", "generated", "sources", "releases", "curated"}
+          problems = []
+          if set(m) != want: problems.append(f"keys {sorted(m)}")
+          if m.get("schema") != 1: problems.append("schema is not 1")
+          if type(m.get("serial")) is not int or m["serial"] != serial or m.get("version") != serial:
+              problems.append(f"serial/version are not the build's {serial}")
+          if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", str(m.get("generated"))) \
+                  or m["generated"][:10] != date:
+              problems.append(f"generated {m.get('generated')!r} is not on {date}")
+          # S1 is curated-only. S2 replaces this with a per-release check (file names, sha256, sizes).
+          if m.get("releases") != {}: problems.append("releases is not empty (S1 is curated-only)")
+          cur = m.get("curated") or {}
+          committed = open("curated/curated.json", "rb").read()
+          digest = hashlib.sha256(committed).hexdigest()
+          if cur.get("sha256") != digest or cur.get("file") != f"curated-{digest[:16]}.json":
+              problems.append("curated does not name the committed curated/curated.json")
+          else:
+              published = open(os.path.join(site, "v1", cur["file"]), "rb").read()
+              if published != committed: problems.append("the published curated file is not the committed one")
+          for root, _, files in os.walk(site):
+              for name in files:
+                  rel = os.path.relpath(os.path.join(root, name), site)
+                  if os.path.getsize(os.path.join(root, name)) > 600 * 1024:
+                      problems.append(f"{rel} is over 600 KB")
+                  if rel not in (".nojekyll", "v1/manifest.json") and not re.fullmatch(r"v1/curated-[0-9a-f]{16}\.json", rel):
+                      problems.append(f"unexpected file {rel}")
+          for p in problems:
+              print(f"::error::Refusing to sign: {p}")
+          if problems:
+              sys.exit(1)
+          print(f"artifact checked: serial {serial}, {cur['file']} is the committed curated file")
+          PY
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+          minisign -v
+
+      - name: Check the public keys are the pinned ones
+        run: |
+          set -euo pipefail
+          for pair in "feed:$FEED_KEY_ID" "emergency:$EMERGENCY_KEY_ID"; do
+            role=${pair%%:*}; want=${pair#*:}
+            got=$(python3 -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
+            [ "$got" = "$want" ] || { echo "::error::keys/vulnfeed-$role.pub has key id $got, the workflow pins $want"; exit 1; }
+          done
+
+      # The feed key has no password (minisign -W): it signs unattended.
+      - name: Sign with the feed key
+        env:
+          VULNFEED_MINISIGN_KEY: ${{ secrets.VULNFEED_MINISIGN_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "${VULNFEED_MINISIGN_KEY:-}" ]; then
+            echo "::error::VULNFEED_MINISIGN_KEY is not set in the vulnfeed-signing environment."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/vulnfeed-feed.key"
+          trap 'shred -u "$key" 2>/dev/null || rm -f "$key"' EXIT
+          printf '%s\n' "$VULNFEED_MINISIGN_KEY" > "$key"
+          m="$RUNNER_TEMP/site/v1/manifest.json"
+          rm -f "$m.minisig"
+          minisign -S -s "$key" -m "$m" -x "$m.minisig" \
+            -t "vulnfeed=host-vulns version=$SERIAL date=$DATE commit=$GITHUB_SHA" </dev/null >/dev/null
+
+      - name: Verify before publishing
+        run: |
+          set -euo pipefail
+          m="$RUNNER_TEMP/site/v1/manifest.json"
+          minisign -V -q -p keys/vulnfeed-feed.pub -m "$m" -x "$m.minisig"
+          if minisign -V -q -p keys/vulnfeed-emergency.pub -m "$m" -x "$m.minisig" 2>/dev/null; then
+            echo "::error::the signature verifies against the EMERGENCY key; the secret holds the wrong key"; exit 1
+          fi
+          want="trusted comment: vulnfeed=host-vulns version=$SERIAL date=$DATE commit=$GITHUB_SHA"
+          got=$(sed -n 3p "$m.minisig")
+          [ "$got" = "$want" ] || { echo "::error::trusted comment is '$got', expected '$want'"; exit 1; }
+          echo "Verified against keys/vulnfeed-feed.pub ($FEED_KEY_ID): ${got#trusted comment: }" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    name: Deploy to Pages
+    needs: sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  smoke:
+    name: Verify the live manifest
+    needs: [build, deploy]
+    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      SERIAL: ${{ needs.build.outputs.serial }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /keys/
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+
+      # The CDN caches each file for up to 600 s: a lagging serial is a warning, a signature that does not
+      # verify (or a live serial above this one) fails the job.
+      - name: Fetch and verify the live pair
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3 4; do
+            token="$(date +%s)$RANDOM"
+            if curl -fsS --max-time 20 -H 'Cache-Control: no-cache' -o m.json "$SITE_URL/v1/manifest.json?r=$token" \
+               && curl -fsS --max-time 20 -H 'Cache-Control: no-cache' -o m.json.minisig "$SITE_URL/v1/manifest.json.minisig?r=$token" \
+               && minisign -V -q -p keys/vulnfeed-feed.pub -m m.json -x m.json.minisig; then
+              live=$(python3 -c 'import json; print(json.load(open("m.json"))["serial"])')
+              if [ "$live" = "$SERIAL" ]; then
+                echo "OK: the live manifest is serial $live and verifies against the feed key." | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              if [ "$live" -gt "$SERIAL" ]; then
+                echo "::error::ALARM: the live manifest is serial $live, above the published $SERIAL."; exit 1
+              fi
+              echo "attempt $attempt: live serial $live, waiting for $SERIAL"
+            else
+              echo "attempt $attempt: the live pair did not fetch or verify"
+            fi
+            [ "$attempt" -lt 4 ] && sleep 200
+          done
+          echo "::warning::the live manifest is not serial $SERIAL after 4 tries; most likely the CDN has not caught up."
+
+  record:
+    name: Commit the build record
+    needs: [build, deploy]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      SERIAL: ${{ needs.build.outputs.serial }}
+    steps:
+      # The only job with a write token. It runs git and inline checks only, never repository code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-record
+          path: ${{ runner.temp }}/record
+
+      - name: Commit builds/<serial>.json
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/record/build.json"
+          [ -f "$src" ] && [ ! -L "$src" ] || { echo "::error::no build record"; exit 1; }
+          [ "$(stat -c %s "$src")" -le 262144 ] || { echo "::error::the build record is over 256 KB"; exit 1; }
+          python3 -c 'import json, os, sys; r = json.load(open(sys.argv[1])); s = int(os.environ["SERIAL"]); assert type(r["serial"]) is int and r["serial"] == s and r["manifest"]["serial"] == s, "record serial mismatch"' "$src"
+          case "$SERIAL" in ''|*[!0-9]*) echo "::error::bad serial $SERIAL"; exit 1 ;; esac
+          mkdir -p builds
+          [ ! -e "builds/$SERIAL.json" ] || { echo "::error::builds/$SERIAL.json already exists"; exit 1; }
+          cp "$src" "builds/$SERIAL.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898233+github-actions[bot]@users.noreply.github.com"
+          git add "builds/$SERIAL.json"
+          git commit -q -m "vulnfeed serial $SERIAL"
+          for attempt in 1 2 3; do
+            if git push -q origin HEAD:main; then
+              echo "Committed builds/$SERIAL.json." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            git pull -q --rebase origin main
+          done
+          echo "::error::could not push builds/$SERIAL.json; the next build floors its serial on the live manifest"
+          exit 1
