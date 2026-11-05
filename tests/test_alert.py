@@ -142,6 +142,34 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(self.kinds(check.evaluate(f"http://127.0.0.1:{port}", self.keys, FRESH)),
                          ["fetch-manifest"])
 
+    def write_record(self, stale):
+        records = os.path.join(self.repo, "records")
+        os.makedirs(records, exist_ok=True)
+        with open(os.path.join(records, "1.json"), "w") as handle:
+            json.dump({"serial": 1, "stale": stale}, handle)
+        return "file://" + records
+
+    def test_release_stale_over_48_hours_is_its_own_problem(self):
+        self.sign_with(self.feed_key)
+        recent = self.write_record({"debian-12": {"since": "2026-11-04T17:10:00Z", "reason": "archive: 503"}})
+        result = check.evaluate("file://" + self.site, self.keys, FRESH, record_url=recent)
+        self.assertEqual(self.kinds(result), [])
+        self.assertEqual(result["stale_releases"], ["debian-12"])
+        old = self.write_record({"debian-12": {"since": "2026-11-03T05:10:00Z", "reason": "archive: 503"}})
+        result = check.evaluate("file://" + self.site, self.keys, FRESH, record_url=old)
+        self.assertEqual(self.kinds(result), ["stale-release"])
+        self.assertIn("debian-12 since 2026-11-03T05:10:00Z", result["problems"][0]["detail"])
+
+    def test_missing_record_is_a_problem(self):
+        self.sign_with(self.feed_key)
+        result = check.evaluate("file://" + self.site, self.keys, FRESH,
+                                record_url="file://" + os.path.join(self.repo, "nowhere"))
+        self.assertEqual(self.kinds(result), ["fetch-record"])
+
+    def test_record_check_skipped_without_a_record_url(self):
+        self.sign_with(self.feed_key)
+        self.assertEqual(self.kinds(check.evaluate("file://" + self.site, self.keys, FRESH)), [])
+
     def test_one_blip_is_retried(self):
         calls = []
         real = check._fetch_once

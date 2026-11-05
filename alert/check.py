@@ -14,6 +14,15 @@ Environment (all optional):
     VULNFEED_ALERT_MAX_AGE_HOURS default 24
     VULNFEED_ALERT_GH_REPO       default AG-Studio-Apps/meshTerm (a PRIVATE repo, so the issue is private)
     VULNFEED_ALERT_STATE         default $XDG_STATE_HOME/vulnfeed-freshness
+    VULNFEED_ALERT_RECORD_URL    where builds/<serial>.json is read, default the COMMITTED record on main
+                                 (raw.githubusercontent.com); unset with a non-default VULNFEED_ALERT_URL, the
+                                 record check is skipped (tests, local sites)
+    VULNFEED_ALERT_STALE_RELEASE_HOURS  default 48
+
+The S2 release files are fail-soft: a release that fails a build keeps its previous file, and the build record
+(unsigned, committed by the workflow's record job) marks it `stale` with the time it first failed. A release
+carried forward for more than 48 h is its own problem kind, `stale-release`, so the issue says which release
+stopped refreshing even while the feed as a whole is fresh.
 """
 import datetime
 import hashlib
@@ -35,6 +44,8 @@ from feedlib import FILE_CAP, MANIFEST_CAP, FeedError, loads_strict  # noqa: E40
 import sign  # noqa: E402
 
 DEFAULT_URL = "https://ag-studio-apps.github.io/meshterm-vulnfeed"
+DEFAULT_RECORD_URL = "https://raw.githubusercontent.com/AG-Studio-Apps/meshterm-vulnfeed/main/builds"
+RECORD_CAP = 256 * 1024
 LABEL = "vulnfeed"
 TITLE = "vulnfeed: the live host vulnerability feed is stale or does not verify"
 SIG_CAP = 4 * 1024
@@ -89,7 +100,7 @@ def fetch(url, cap, token=None):
     return _fetch_once(url, cap)
 
 
-def evaluate(base_url, keys_dir, now, max_age_hours=24):
+def evaluate(base_url, keys_dir, now, max_age_hours=24, record_url=None, stale_release_hours=48):
     """The verdict: {"ok", "problems": [{"kind", "detail"}], "serial", "generated", "age_hours", "signer"}."""
     base = base_url.rstrip("/")
     token = secrets.token_hex(8)
@@ -135,8 +146,36 @@ def evaluate(base_url, keys_dir, now, max_age_hours=24):
             problem("curated-sha256", f"{curated.get('file')} does not match the signed sha256")
     except (OSError, urllib.error.URLError, FeedError) as error:
         problem("fetch-curated", f"{curated.get('file')}: {error}")
+    if record_url:
+        check_record(record_url, manifest, now, stale_release_hours, problem, result)
     result["ok"] = not result["problems"]
     return result
+
+
+def check_record(record_url, manifest, now, limit_hours, problem, result):
+    """The committed build record of the live serial: any release carried forward (`stale`) for more than
+    `limit_hours` is a `stale-release` problem. The record job commits right after signing, so a record that
+    is missing 90 minutes after the build (the timer's offset) is itself a problem (`fetch-record`)."""
+    serial = manifest.get("serial")
+    try:
+        record = loads_strict(fetch(f"{record_url.rstrip('/')}/{serial}.json", RECORD_CAP, secrets.token_hex(8)))
+    except (OSError, urllib.error.URLError, FeedError) as error:
+        return problem("fetch-record", f"builds/{serial}.json: {error}")
+    if not isinstance(record, dict) or record.get("serial") != serial:
+        return problem("fetch-record", f"builds/{serial}.json does not record serial {serial}")
+    old = []
+    for key, info in sorted((record.get("stale") or {}).items()):
+        try:
+            since = _parse_time(info["since"])
+        except (KeyError, TypeError, ValueError):
+            old.append(f"{key} (no valid since)")
+            continue
+        hours = (now - since).total_seconds() / 3600
+        if hours > limit_hours:
+            old.append(f"{key} since {info['since']} ({hours:.0f} h: {str(info.get('reason', ''))[:80]})")
+    result["stale_releases"] = sorted((record.get("stale") or {}))
+    if old:
+        problem("stale-release", f"carried forward for more than {limit_hours:.0f} h: " + "; ".join(old))
 
 
 def fingerprint(result):
@@ -233,7 +272,9 @@ def main(argv=None, runner=None, now=None):
     url = os.environ.get("VULNFEED_ALERT_URL", DEFAULT_URL)
     keys_dir = os.environ.get("VULNFEED_ALERT_KEYS_DIR") or _default_keys_dir()
     max_age = float(os.environ.get("VULNFEED_ALERT_MAX_AGE_HOURS", "24"))
-    result = evaluate(url, keys_dir, now, max_age)
+    record_url = os.environ.get("VULNFEED_ALERT_RECORD_URL") or (DEFAULT_RECORD_URL if url == DEFAULT_URL else None)
+    stale_hours = float(os.environ.get("VULNFEED_ALERT_STALE_RELEASE_HOURS", "48"))
+    result = evaluate(url, keys_dir, now, max_age, record_url, stale_hours)
     if command == "evaluate":
         print(json.dumps(result, indent=1, sort_keys=True))
         return 0 if result["ok"] else 2
