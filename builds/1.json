@@ -1,0 +1,24 @@
+{
+ "carried": [],
+ "commit": "d43ace7c141990bff3bc455c5aec9783ac822512",
+ "log": [
+  "serial 1 (builds/ high-water 0, live none)",
+  "curated: 2 rule(s) -> curated-25abfc9f67145d28.json",
+  "releases: none (S1 is curated-only; the OSV builder is S2)",
+  "gate: pass (serial 1, 257 byte manifest, 775 bytes in the site)"
+ ],
+ "manifest": {
+  "curated": {
+   "file": "curated-25abfc9f67145d28.json",
+   "sha256": "25abfc9f67145d2851a06db7f920192b83f6f2de63e2ea650d802f4fff9aa63b"
+  },
+  "generated": "2026-11-05T12:54:22Z",
+  "releases": {},
+  "schema": 1,
+  "serial": 1,
+  "sources": {},
+  "version": 1
+ },
+ "serial": 1,
+ "warnings": []
+}
