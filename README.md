@@ -46,7 +46,8 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
              "archive": {"noble": "2024-04-25T15:10:33Z", "noble-security": "2026-11-05T03:38:05Z", "...": "..."},
              "baseline": {"ubuntu-24.04": "2024-04-25", "debian-12": "2023-06-10", "...": "..."}},
  "releases": {"ubuntu-24.04": {"format": "dpkg", "file": "r/ubuntu-24.04-8dcc0c17b45f0405.json",
-                               "sha256": "8dcc0c17...", "bytes": 38955, "rows": 892}, "...": {}},
+                               "sha256": "8dcc0c17...", "bytes": 38955, "rows": 892,
+                               "eol": "2029-05-31", "eolPro": "2034-04-25"}, "...": {}},
  "curated": {"file": "curated-25abfc9f67145d28.json", "sha256": "25abfc9f...aa63b"}}
 ```
 
@@ -82,6 +83,28 @@ for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`, `alpine-3.20` ..
 `Alpine:v3.24`), `alma-8` .. `alma-10` and `rhel-8` .. `rhel-10` (S5). **alpine-3.20 (EOL 2026-04-01) and alpine-3.21 (EOL 2026-11-01) are past end of life**
 (alpinelinux.org/releases.json). James decided (2026-11-05) to keep them while secdb still publishes their
 branches; the app's S6 adds an end-of-life note for such hosts.
+
+### End of life (S6: `eol`, `eolPro`)
+
+Each release entry carries `eol`, the LAST day the release gets security fixes (`YYYY-MM-DD`, a real calendar
+date). A base Ubuntu entry (`ubuntu-NN.NN`) whose release has Ubuntu Pro also carries `eolPro`, the last day of ESM,
+never before `eol`. The `-esm` entries carry neither (the app reads the base entry). A release with no known date
+carries no field. The fields come from a REVIEWED TABLE, `builder/eol.py`, never from a build-time fetch
+(distro-info-data's CSVs on salsa are unsigned, the dates change about twice a year, and a new network input is a new
+failure mode). The builder sets them on every build, carried-forward entries included (an old record's value is
+dropped), and `check_manifest` requires each entry to carry exactly the table's fields. The sign job checks them
+inline: real dates, `eolPro` only on an `ubuntu-NN.NN` key and only with an `eol` it is not before.
+
+Sources (read 2026-11-05; each entry records its source and read date): Ubuntu, distro-info-data `ubuntu.csv`
+(`eol`, `eol-esm`); Debian, distro-info-data `debian.csv` `eol-lts` (Debian LTS; ELTS is a paid third party, not
+used); Alpine, alpinelinux.org `releases.json` `eol_date` (taken as the last day); RHEL and AlmaLinux, the end of
+Maintenance Support on Red Hat's life cycle page and AlmaLinux's release notes ("until 31 May" is the last day; 8's
+older 2029-03-01 figure is superseded). Rocky hosts use the `rhel-*` dates.
+
+**Updating the table**: read the vendor source, change the date (or add the key) in `builder/eol.py`, set that entry's
+`read` to the day you read it, and run the tests: `tests/test_eol.py` fails for a release key (not `-esm`) with no
+entry and no reason in its `NO_DATE`, a malformed date, or an `eolPro` on the wrong key or before `eol`. Adding a
+release (below) needs its entry too.
 
 ### Alpine (S4, `format: "apk"`)
 
@@ -228,6 +251,7 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
 2. Give it a minimum in `gates/minimums.json` (the build refuses a release without one). Its first build has no
    previous count, so that minimum is its only row floor.
 3. A new Debian release also needs `build.py baseline --release <key>`.
+4. Its end-of-life dates in `builder/eol.py` (`tests/test_eol.py` fails without them).
 
 **Dropping a release** (an end-of-life interim), in one pull request:
 

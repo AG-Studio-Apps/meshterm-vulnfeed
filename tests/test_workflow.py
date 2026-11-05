@@ -164,6 +164,61 @@ class SignJobCheck(unittest.TestCase):
         self.assertIn("'debian-99' is not on the allowlist", result.stdout)
         self.assertIn("unexpected file v1/r/evil-0123456789abcdef.json", result.stdout)
 
+    def edit_entry(self, key, change):
+        path = os.path.join(self.out, "v1", "manifest.json")
+        with open(path) as handle:
+            manifest = json.load(handle)
+        entry = manifest["releases"].setdefault(key, dict(manifest["releases"]["debian-12"]))
+        change(entry)
+        with open(path, "w") as handle:
+            json.dump(manifest, handle)
+
+    def test_eol_fields_checked(self):
+        # S6: the build set debian-12's eol from builder/eol.py, and the check accepts it.
+        self.assertEqual(self.manifest["releases"]["debian-12"]["eol"], "2028-06-30")
+        cases = [
+            ("debian-12", lambda e: e.update(eol="2028-02-30"), "eol is not a YYYY-MM-DD date"),
+            ("debian-12", lambda e: e.update(eol="28-06-30"), "eol is not a YYYY-MM-DD date"),
+            ("debian-12", lambda e: e.update(eol=20280630), "eol is not a YYYY-MM-DD date"),
+            ("debian-12", lambda e: e.update(eolPro="2030-06-30"), "eolPro on a key that is not ubuntu-NN.NN"),
+            ("ubuntu-24.04-esm", lambda e: e.update(eol="2029-05-31", eolPro="2034-04-25"),
+             "eolPro on a key that is not ubuntu-NN.NN"),
+            ("ubuntu-24.04", lambda e: e.update(eol="2029-05-31", eolPro="2029-05-30"),
+             "eolPro without eol, or before it"),
+            ("ubuntu-24.04", lambda e: (e.pop("eol"), e.update(eolPro="2034-04-25")),
+             "eolPro without eol, or before it"),
+            ("ubuntu-24.04", lambda e: e.update(eol="2029-05-31", eolPro="2034-04-31"),
+             "eolPro is not a YYYY-MM-DD date"),
+            ("debian-12", lambda e: e.update(eolDate="2028-06-30"), "bad entry keys"),
+        ]
+        for key, change, why in cases:
+            with self.subTest(why=why, key=key):
+                self.setUp()
+                self.edit_entry(key, change)
+                result = self.run_check()
+                self.assertNotEqual(result.returncode, 0, why)
+                self.assertIn(f"release {key}: {why}", result.stdout)
+
+    def test_eol_problem_accepts(self):
+        text = sign_check_script()
+        namespace = {}
+        exec("import datetime, re\n" + textwrap.dedent(text[text.index("entry_keys = "):text.index("# S5 review L7 / S6")]),
+             namespace)
+        problem = namespace["eol_problem"]
+        for key, entry in (("ubuntu-24.04", {"eol": "2029-05-31", "eolPro": "2034-04-25"}),
+                           ("ubuntu-24.04", {"eol": "2029-05-31", "eolPro": "2029-05-31"}),
+                           ("ubuntu-26.10", {"eol": "2027-07-15"}), ("debian-12", {}),
+                           ("alpine-3.24", {"eol": "2028-06-01"}), ("ubuntu-24.04-esm", {})):
+            self.assertIsNone(problem(key, entry), (key, entry))
+        import eol
+        for key in osvfeed.RELEASE_KEYS:
+            self.assertIsNone(problem(key, eol.fields(key)), key)
+            for name in ("eol", "eolPro"):      # the same verdicts as the builder's check_fields on bad values
+                for value in ("2029-02-29", "2029-5-1", None):
+                    entry = dict(eol.fields(key), **{name: value})
+                    self.assertEqual(problem(key, entry) is None, eol.check_fields(key, entry) is None,
+                                     (key, entry))
+
     def test_bad_sources_refused(self):
         path = os.path.join(self.out, "v1", "manifest.json")
         with open(path) as handle:
@@ -390,6 +445,24 @@ class SignJobRpm(SignJobFormats):
             (lambda b: b["ids"].append("CVE-2026-19999"), "has a bad rpm table (an id or a fix nothing refers to)"),
             (lambda b: b["ids"].insert(0, "RHSA-2026:1"), "has a bad rpm ids table"),
             (lambda b: b.update(ids={"CVE-2026-10001": 0}), "has a bad rpm ids table"),
+            # S6 (S5 review LOW): severities High/Critical only, streams short strings, no kernel binary in pkgs,
+            # kernel keys only RPM_KERNELS.
+            (lambda b: b["fixes"][0].__setitem__(2, 2), "has a bad rpm fix severity or streams"),
+            (lambda b: b["fixes"][0].__setitem__(2, "3"), "has a bad rpm fix severity or streams"),
+            (lambda b: b["fixes"][0].__setitem__(2, 3.0), "has a bad rpm fix severity or streams"),
+            (lambda b: b["fixes"][0].__setitem__(4, ["php:" + "8" * 61]), "has a bad rpm fix severity or streams"),
+            (lambda b: b["fixes"][0].__setitem__(4, "php:8.1"), "has a bad rpm fix severity or streams"),
+            (lambda b: b["fixes"][0].__setitem__(4, [81]), "has a bad rpm fix severity or streams"),
+            (lambda b: b["pkgs"].update({"kernel-modules": b["pkgs"]["openssl-libs"]}),
+             "has a bad rpm pkgs binary (a kernel binary)"),
+            (lambda b: b["pkgs"].update({"kernel": b["pkgs"]["openssl-libs"]}),
+             "has a bad rpm pkgs binary (a kernel binary)"),
+            (lambda b: b["pkgs"].update({"perf": b["pkgs"]["openssl-libs"]}),
+             "has a bad rpm pkgs binary (a kernel binary)"),
+            (lambda b: b["kernel"].update({"kernel-modules": b["kernel"].pop("kernel-core")}),
+             "has a bad rpm kernel binary (not one of RPM_KERNELS)"),
+            (lambda b: b["kernel"].update({"kernel": b["kernel"].pop("kernel-core")}),
+             "has a bad rpm kernel binary (not one of RPM_KERNELS)"),
         ]
         for change, why in cases:
             with self.subTest(why=why):
@@ -398,10 +471,20 @@ class SignJobRpm(SignJobFormats):
                 result = self.run_check()
                 self.assertNotEqual(result.returncode, 0, why)
                 self.assertIn(why, result.stdout)
-        self.setUp()
-        self.rewrite_body(lambda b: None)
-        result = self.run_check()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for change in (lambda b: None, lambda b: b["fixes"][0].__setitem__(2, 4),
+                       lambda b: b["fixes"][0].__setitem__(4, ["php:" + "8" * 60]),
+                       lambda b: b["kernel"].update({"kernel-rt-core": b["kernel"].pop("kernel-core")})):
+            self.setUp()
+            self.rewrite_body(change)
+            result = self.run_check()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_kernel_sets_match_the_builder(self):
+        text = sign_check_script()
+        for name, want in (("rpm_kernels", osvfeed.RPM_KERNELS), ("rpm_kernel_userspace", osvfeed.RPM_KERNEL_USERSPACE)):
+            match = re.search(name + r" = \{([^}]*)\}", text)
+            self.assertIsNotNone(match, name)
+            self.assertEqual(set(re.findall(r'"([A-Za-z0-9.+-]+)"', match.group(1))), set(want), name)
 
     def test_rhel_keys_are_rpm(self):
         text = sign_check_script()

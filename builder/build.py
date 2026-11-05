@@ -33,6 +33,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from feedlib import (FILE_CAP, FILE_RE, GENERATED_RE, KEEP_BUILDS, MANIFEST_CAP, MANIFEST_SCHEMA,  # noqa: E402
                      FeedError, content_name, dumps, is_int, loads_strict, sha256_hex)
+import eol  # noqa: E402
 import osvfeed  # noqa: E402
 import validate_curated  # noqa: E402
 
@@ -40,6 +41,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 MANIFEST_KEYS = {"schema", "version", "serial", "generated", "sources", "releases", "curated"}
 RELEASE_KEYS = {"format", "file", "sha256", "bytes", "rows"}
+# S6: an entry may also carry `eol` (and a base Ubuntu one `eolPro`), exactly as builder/eol.py's table says.
+RELEASE_OPTIONAL_KEYS = set(eol.FIELDS)
 RELEASE_FORMATS = ("dpkg", "apk", "rpm")
 OSV_ZIPS = ("Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -299,8 +302,14 @@ def check_manifest(manifest):
     for key, entry in releases.items():
         if key not in osvfeed.RELEASE_KEYS:
             raise FeedError(f"release key {key!r} is not in the allowlist")
-        if not isinstance(entry, dict) or set(entry) != RELEASE_KEYS:
-            raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)}")
+        if not isinstance(entry, dict) or not RELEASE_KEYS <= set(entry) <= RELEASE_KEYS | RELEASE_OPTIONAL_KEYS:
+            raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)} plus optional "
+                            f"{sorted(RELEASE_OPTIONAL_KEYS)}")
+        problem = eol.check_fields(key, entry)
+        if problem:
+            raise FeedError(f"release {key}: {problem}")
+        if {k: entry[k] for k in eol.FIELDS if k in entry} != eol.fields(key):
+            raise FeedError(f"release {key}: eol/eolPro must be builder/eol.py's {eol.fields(key) or 'none'}")
         if entry["format"] not in RELEASE_FORMATS or entry["format"] != osvfeed.FORMAT_OF[key]:
             raise FeedError(f"release {key}: format must be {osvfeed.FORMAT_OF[key]!r}")
         if not isinstance(entry["file"], str) or not FILE_RE.fullmatch(entry["file"]) \
@@ -437,6 +446,7 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
     releases, sources, failures = build_releases(site_v1, log, options, previous, now[:10], now, previous_dates)
     seen_dates = dict(sources.get("archive") or {})
     stale = carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log)
+    eol.apply(releases)     # S6: from the reviewed table, carried-forward entries too (never an old record's value)
     if not releases:
         sources = {}
 
