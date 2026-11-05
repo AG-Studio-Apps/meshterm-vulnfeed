@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ag-studio-apps.github.io/meshterm-vulnfeed/manifest.schema.json",
+  "title": "meshTerm vulnfeed manifest (v1/manifest.json, schema 1)",
+  "description": "Documentation only: builder/build.py check_manifest() is authoritative. The only signed file; every other file is verified by the sha256 recorded here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "version", "serial", "generated", "sources", "releases", "curated"],
+  "properties": {
+    "schema": {"const": 1},
+    "serial": {"type": "integer", "minimum": 1, "description": "The number in the trusted comment's version= token."},
+    "version": {"type": "integer", "minimum": 1, "description": "Always equal to serial, so SignedArtifactVerifier.jsonVersion(of:) reads it."},
+    "generated": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+    "sources": {"type": "object", "description": "S2: OSV high-water time and archive Sources dates. Empty in S1."},
+    "releases": {
+      "type": "object",
+      "description": "S2: release key -> file. Empty in S1 (curated-only).",
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9.-]{0,40}$"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["format", "file", "sha256", "bytes", "rows"],
+        "properties": {
+          "format": {"enum": ["dpkg", "apk", "rpm"]},
+          "file": {"type": "string", "pattern": "^r/[a-z0-9][a-z0-9.-]{0,40}-[0-9a-f]{16}\\.json$"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "bytes": {"type": "integer", "minimum": 0, "maximum": 614400},
+          "rows": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "curated": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "sha256"],
+      "properties": {
+        "file": {"type": "string", "pattern": "^curated-[0-9a-f]{16}\\.json$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ag-studio-apps.github.io/meshterm-vulnfeed/curated.schema.json",
+  "title": "meshTerm vulnfeed curated rules",
+  "description": "Hand-written rules, reviewed in pull requests. Documentation only: builder/validate_curated.py is authoritative and also refuses what a schema cannot express (duplicate keys, command-like field names, fixedIn below the floor, shell metacharacters in text).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules"],
+  "properties": {
+    "rules": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "product", "below", "severity", "title", "fixedIn", "appliesTo"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{2,63}$"},
+          "product": {"enum": ["tailscale"]},
+          "below": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})$"},
+          "fixedIn": {"type": "string", "pattern": "^(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})$"},
+          "severity": {"type": "integer", "minimum": 1, "maximum": 4, "description": "1 low/recommended, 2 medium, 3 high, 4 critical"},
+          "kind": {"enum": ["security", "recommended"], "default": "security"},
+          "ids": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Z][A-Z0-9]{0,15}(-[A-Z0-9]{1,16}){1,4}$"}},
+          "title": {"type": "string", "minLength": 3, "maxLength": 120},
+          "url": {"type": "string", "pattern": "^https://[a-z0-9.-]+(/[A-Za-z0-9._~/%-]*)?$", "maxLength": 200},
+          "appliesTo": {"enum": ["any", "tailnet"]}
+        }
+      }
+    }
+  }
+}
