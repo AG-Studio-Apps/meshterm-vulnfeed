@@ -332,9 +332,11 @@ class Archive(unittest.TestCase):
 
 
 class Golden(unittest.TestCase):
-    def row(self, source, fixed, date="2026-10-01", source_kind="advisory", modified="2026-10-02", intro="0"):
+    def row(self, source, fixed, date="2026-10-01", source_kind="advisory", modified="2026-10-02", intro="0",
+            rule="cvss"):
         return {"source": source, "introduced": intro, "fixed": fixed, "severity": 3, "ids": ["CVE-2026-1"],
-                "kernel": False, "date": date, "dateSource": source_kind, "modified": modified}
+                "kernel": False, "date": date, "dateSource": source_kind, "modified": modified,
+                "rules": {"CVE-2026-1": rule}}
 
     def test_capture_date_filter(self):
         inventory = {"apt": "2.6.1", "glibc": "2.36-9+deb12u10", "curl": "7.88.1-10+deb12u5"}
@@ -396,6 +398,27 @@ class Golden(unittest.TestCase):
         base.update(case)
         with open(os.path.join(tmp, "expected.json"), "w") as handle:
             json.dump({"cases": [base]}, handle)
+
+    def test_extra_hits_fail_when_many_or_heuristic(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        self.write_case(tmp, exact=["apt"])
+        with open(os.path.join(tmp, "inv.tsv"), "a") as handle:
+            handle.write("tar\t1.34+dfsg-1.2\n")
+        with open(os.path.join(tmp, "inv.archive.tsv"), "a") as handle:
+            handle.write("tar\t1.34+dfsg-1.2+deb12u1\n")
+        apt, sed = self.row("apt", "2.6.2"), self.row("sed", "4.9-1+deb12u1")
+        pcre2, tar = self.row("pcre2", "10.42-1+deb12u2"), self.row("tar", "1.34+dfsg-1.2+deb12u1")
+        log = helpers_log()
+        self.assertEqual(osvfeed.check_golden("debian-12", [apt, sed, pcre2], log, tmp), [], "2 extra: warn")
+        self.assertTrue(any("also flags ['pcre2', 'sed']" in w for w in log.warnings))
+        failures = osvfeed.check_golden("debian-12", [apt, sed, pcre2, tar], log, tmp)
+        self.assertIn("3 unexpected sources flagged", failures[0])
+        heuristic = self.row("sed", "4.9-1+deb12u1", rule="dsa/dla exists -> high")
+        failures = osvfeed.check_golden("debian-12", [apt, heuristic], log, tmp)
+        self.assertIn("rated High by a heuristic rule, not a score: sed (dsa/dla exists -> high)", failures[0])
+        package = self.row("sed", "4.9-1+deb12u1", rule="ubuntu package priority")
+        self.assertTrue(osvfeed.check_golden("debian-12", [apt, package], log, tmp))
 
     def test_check_golden_errors_and_warnings(self):
         tmp = tempfile.mkdtemp()
@@ -647,6 +670,23 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("noble: InRelease Date 2024-04-25T15:10:33Z is older than the 2024-04-26T00:00:00Z",
                       failures["ubuntu-24.04"])
 
+    def test_rows_record_each_ids_severity_rule(self):
+        _, _, _ = self.run_build()
+        with open(os.path.join(self.tmp, "work", "ubuntu-24.04.rows.json")) as handle:
+            rows = json.load(handle)["rows"]
+        self.assertEqual({r["source"]: r["rules"] for r in rows},
+                         {"openssl": {"CVE-2026-0050": "ubuntu priority"},
+                          "linux-gcp": {"CVE-2026-0051": "ubuntu priority"}})
+
+    def test_a_code_bug_is_marked_as_a_bug(self):
+        def broken(*args, **kwargs):
+            raise KeyError("rows")
+        self.patch(osvfeed, "_one_release", broken)
+        _, _, (releases, _, failures) = self.run_build()
+        self.assertEqual(releases, {})
+        self.assertTrue(failures["ubuntu-24.04"].startswith("bug: build: KeyError: 'rows'"))
+        self.assertIn("Traceback", failures["ubuntu-24.04"])
+
     def test_tampered_sources_fails_soft(self):
         path = os.path.join(self.mirror, "dists", "noble", "main", "source", "Sources.xz")
         with open(path, "wb") as handle:
@@ -654,6 +694,7 @@ class EndToEnd(unittest.TestCase):
         _, _, (releases, _, failures) = self.run_build()
         self.assertEqual(releases, {})
         self.assertIn("(truncated?)", failures["ubuntu-24.04"])   # size first, then the digest
+        self.assertFalse(failures["ubuntu-24.04"].startswith(osvfeed.BUG_PREFIX), "upstream-shaped, not a bug")
         with open(path, "wb") as handle:
             handle.write(b"x" * 100)                                 # same size, other bytes
         _, _, (releases, _, failures) = self.run_build(cache="cache4")

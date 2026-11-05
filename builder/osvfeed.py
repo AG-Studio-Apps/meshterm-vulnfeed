@@ -607,13 +607,14 @@ def resolve(release, cands, info, archive, baseline, counters, decisions):
                 continue
         else:
             counters["published check skipped (ESM archive needs a token)"] += 1
-        kept, best = {}, -1
+        kept, rules, best = {}, {}, -1
         for cve in cand.ids:
             band, rule = severity(release, cve, cand, info)
             decisions[rule] += 1
             best = max(best, band)
             if band >= HIGH:
                 kept[cve] = band
+                rules[cve] = rule
         if not kept:
             drop("below High (dropped)")
             dropped[-1].append(best)
@@ -622,7 +623,8 @@ def resolve(release, cands, info, archive, baseline, counters, decisions):
         date, date_source = (cand.adv_date, "advisory") if cand.adv_date else (cand.rec_date, "record")
         rows.append({"source": source, "introduced": introduced, "fixed": fixed,
                      "severity": max(kept.values()), "ids": sorted(kept), "kernel": is_kernel(source),
-                     "date": date, "dateSource": date_source, "modified": cand.modified})
+                     "date": date, "dateSource": date_source, "modified": cand.modified,
+                     "rules": dict(sorted(rules.items()))})
     return rows, examples, dropped
 
 
@@ -830,13 +832,21 @@ def golden_cases(golden_dir=GOLDEN_DIR):
         return json.load(handle)["cases"]
 
 
+EXTRA_HIT_LIMIT = 3     # unexpected golden sources: up to 2 warn, 3 or more fail
+# Severity rules that are not a published score: an unexpected golden hit rated High by one of these fails, since
+# it says more about our chain than about the data.
+HEURISTIC_RULES = ("ubuntu package priority", "dsa/dla exists -> high")
+
+
 def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
     """The golden cases of one release. Returns the failures (an empty list when they pass).
 
     Errors: an expected source not flagged (a regression that drops a real fix), and a would-be hit on a
     source the frozen archive file does not list. A flagged source the case does not expect is a WARNING:
     every row counted is already pinned to the archive at capture, so an extra hit can only come from OSV
-    re-rating an old CVE (Medium to High) or adding ids, which is data, not a builder regression."""
+    re-rating an old CVE (Medium to High) or adding ids, which is data, not a builder regression. Except: 3 or
+    more unexpected sources, or any unexpected hit whose High came from a HEURISTIC_RULES rule (per-id
+    provenance is in each row's `rules`), fail."""
     failures = []
     for case in golden_cases(golden_dir):
         if case["release"] != key:
@@ -854,8 +864,18 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
                             + ", ".join(unarchived[:5]))
         extra = sorted(got - expected) if "exact" in case else []
         if extra:
-            log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
-                     "fix that was in the archive at capture; update expected.json if it is right)")
+            weak = sorted({f"{row['source']} ({rule})" for row in rows if row["source"] in extra
+                           and row["fixed"] in hits[row["source"]]
+                           for rule in (row.get("rules") or {}).values() if rule in HEURISTIC_RULES})
+            if len(extra) >= EXTRA_HIT_LIMIT:
+                failures.append(f"golden {case['fixture']}: {len(extra)} unexpected sources flagged {extra} "
+                                f"(the limit for a warning is {EXTRA_HIT_LIMIT - 1})")
+            elif weak:
+                failures.append(f"golden {case['fixture']}: unexpected hit(s) rated High by a heuristic rule, "
+                                f"not a score: {', '.join(weak)}")
+            else:
+                log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
+                         "fix that was in the archive at capture; update expected.json if it is right)")
         if not failures:
             log.info(f"golden {case['fixture']} ({key}, before {case['capture']}): {len(got)} source(s) "
                      f"flagged: {detail}")
@@ -940,7 +960,23 @@ def check_gone(previous, releases=RELEASES, retired=RETIRED_RELEASES):
 
 
 # --- the stage -----------------------------------------------------------------------------------------
+# Upstream-shaped failures (network, signature, digest, archive or OSV data): the release goes stale. Anything
+# else is a builder bug: still carried forward (curated keeps publishing), but recorded as `bug` with its
+# traceback, and the workflow ends red.
+UPSTREAM_ERRORS = (FeedError, OSError, EOFError, lzma.LZMAError, zipfile.BadZipFile, json.JSONDecodeError,
+                   UnicodeDecodeError, VersionError, ShapeError, subprocess.SubprocessError)
+BUG_PREFIX = "bug: "
 _SOFT = (Exception,)
+
+
+def soft_reason(context, error):
+    """The failure text for one fail-soft catch: upstream-shaped errors as `context: error`, anything else as
+    BUG_PREFIX + the traceback."""
+    if isinstance(error, UPSTREAM_ERRORS):
+        return f"{context}: {error}"
+    import traceback
+    trace = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    return f"{BUG_PREFIX}{context}: {type(error).__name__}: {error}\n{trace[-3500:]}"
 
 
 def build_releases(site_v1, log, cache, work, previous=None, offline=False, releases=RELEASES,
@@ -969,7 +1005,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
         for key in keys:
             if key not in failures:
                 failures[key] = reason
-                log.warn(f"{key}: not rebuilt, the previous file is carried forward: {reason}")
+                log.warn(f"{key}: not rebuilt, the previous file is carried forward: {reason.splitlines()[0]}")
 
     def dependents(base):
         return [r.key for r in releases if r.base_key == base]
@@ -996,7 +1032,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
             if skipped:
                 log.info(f"archive {release.key}: " + ", ".join(f"{k} {v}" for k, v in skipped.items()))
         except _SOFT as error:
-            fail(dependents(release.key), f"archive: {error}")
+            fail(dependents(release.key), soft_reason("archive", error))
             continue
         sources["archive"].update(dates)
         archives[release.key] = merged
@@ -1018,7 +1054,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
             zip_path = netfetch.fetch_osv_zip(cache, zip_name, log, offline)
             candidates, info, stats, shapes, newest = ingest(zip_path, members, log)
         except _SOFT as error:
-            fail([r.key for r in members], f"osv {zip_name}: {error}")
+            fail([r.key for r in members], soft_reason(f"osv {zip_name}", error))
             continue
         if newest:
             netfetch.record_highwater(cache, zip_name, newest)
@@ -1037,7 +1073,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 zip_fixed += len(candidates[release.key])
                 zip_rejected += pending[release.key]["rejected"]
             except _SOFT as error:
-                fail([release.key], f"build: {error}")
+                fail([release.key], soft_reason("build", error))
         share = zip_rejected / zip_fixed if zip_fixed else 0.0
         log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})")
         if share >= REJECT_LIMIT:

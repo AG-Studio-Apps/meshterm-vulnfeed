@@ -133,6 +133,9 @@ More gates, per release:
   already pinned to the archive at capture, so an extra one can only come from OSV re-rating an old CVE (the
   stock images carry pending Medium fixes, such as pcre2, that could become High) or adding ids. Freezing
   severities and ids instead would stop the gate from noticing a re-rated row that the builder then drops.
+  Extra hits still FAIL when they cover 3 or more sources, or when any of them was rated High by a heuristic
+  rule (`ubuntu package priority`, `dsa/dla exists -> high`) rather than a published score; every shipped row
+  records each id's rule in the intermediates (`rules`).
 
 The intermediates (`--work`, the `intermediates` CI artifact) hold every shipped row with its publish date and
 every dropped row with its reason.
@@ -143,7 +146,12 @@ manifest carries forward its last published entry (same file, sha256, bytes and 
 record that names it, the file re-fetched from the live site and checked), and the UNSIGNED build record gets
 `stale: {release: {since, reason}}` (`since` is when it first failed). The manifest format is unchanged. If the
 whole S2 step fails, every release is carried forward. A release with nothing to carry is left out, and the
-record says `omitted`. Only a broken committed configuration (`gates/`, a missing baseline, a release dropped
+record says `omitted`. A release stale for more than 7 days (from its `since`) is also left out of the manifest,
+so the app's 7-day freshness rule holds per release: it shows nothing for that release rather than old data.
+Upstream-shaped failures (network, signature, digest, archive or OSV data, gates) are plain `stale`. Any other
+exception is a builder BUG: it is carried forward all the same (curated keeps publishing), but the record marks
+it `bug: true` with its `traceback` and lists it in `bugs`, and the workflow's last job (`builder-bug`, after
+deploy and record) fails the run with an `::error::` annotation. Only a broken committed configuration (`gates/`, a missing baseline, a release dropped
 without being retired) and an invalid curated file still fail the build.
 
 Signature (minisign, prehashed Ed25519), trusted comment exactly:
@@ -175,7 +183,9 @@ python3 scripts/sign.py verify --manifest out/v1/manifest.json --role feed --req
 
 Needs `python3` (stdlib only) and `minisign`. The tests generate throwaway keys and never touch the real ones, and
 never touch the network. A full build downloads about 900 MB of OSV zips (Ubuntu's is 0.8 GB) and about 100 MB
-of Sources into `--cache`, and takes 3 to 5 minutes; `--offline` re-runs from the cache.
+of Sources into `--cache`, and takes 3 to 5 minutes; `--offline` re-runs from the cache. `--offline` needs a
+cache that already holds each suite's signed `InRelease` (it re-verifies them), so run once online first: a
+cache from before InRelease verification only has unsigned `Release` files and every release fails offline.
 
 - `build.py baseline --release debian-12` re-generates a Debian baseline (only needed for a new release).
 - `build.py golden-archive` re-generates the golden `.archive.tsv` files (only when a fixture changes).
@@ -191,6 +201,7 @@ Schedule 05:10 and 17:10 UTC, plus `workflow_dispatch`. No pull-request trigger.
 | deploy | `pages: write`, `id-token: write` | `actions/deploy-pages` |
 | smoke | `contents: read` | fetches the live pair and verifies it, then each release file's sha256 (CDN lag is a warning) |
 | record | `contents: write` | commits `builds/<serial>.json` to main (history, and repo activity so GitHub keeps the schedule) |
+| builder-bug | none | only when the build record lists a builder bug: runs after deploy and record and fails the run with an `::error::` |
 
 Every action is pinned by commit SHA (the ones meshterm-recipes uses).
 
@@ -229,7 +240,7 @@ copy of `keys/`, checks the curated file's sha256, and files ONE issue in the pr
 It also reads the build record of the live serial as COMMITTED on main (`builds/<serial>.json` on
 raw.githubusercontent.com; committed, not published, because the record is unsigned and the sign job allows no
 extra files on Pages) and reports `stale-release` when any release has been carried forward for more than 48 h,
-or `fetch-record` when that record is missing. It comments again only when the problem changes or once a day,
+`builder-bug` at once when the record lists a builder bug, or `fetch-record` when that record is missing. It comments again only when the problem changes or once a day,
 flags an emergency-key signature, and closes the issue when the feed recovers. Dry run unless `VULNFEED_ALERT_DRY_RUN=0`. The timer runs at 06:40 and 18:40
 UTC.
 

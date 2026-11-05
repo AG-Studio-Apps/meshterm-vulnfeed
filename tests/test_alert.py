@@ -160,6 +160,14 @@ class AlertTests(unittest.TestCase):
         self.assertEqual(self.kinds(result), ["stale-release"])
         self.assertIn("debian-12 since 2026-11-03T05:10:00Z", result["problems"][0]["detail"])
 
+    def test_builder_bug_is_raised_at_once(self):
+        self.sign_with(self.feed_key)
+        url = self.write_record({"debian-12": {"since": "2026-11-05T05:10:00Z", "bug": True,
+                                               "reason": "bug: build: KeyError: 'rows'", "traceback": "..."}})
+        result = check.evaluate("file://" + self.site, self.keys, FRESH, record_url=url)
+        self.assertEqual(self.kinds(result), ["builder-bug"])
+        self.assertIn("debian-12", result["problems"][0]["detail"])
+
     def test_missing_record_is_a_problem(self):
         self.sign_with(self.feed_key)
         result = check.evaluate("file://" + self.site, self.keys, FRESH,

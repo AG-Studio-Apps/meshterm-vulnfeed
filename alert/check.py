@@ -22,7 +22,8 @@ Environment (all optional):
 The S2 release files are fail-soft: a release that fails a build keeps its previous file, and the build record
 (unsigned, committed by the workflow's record job) marks it `stale` with the time it first failed. A release
 carried forward for more than 48 h is its own problem kind, `stale-release`, so the issue says which release
-stopped refreshing even while the feed as a whole is fresh.
+stopped refreshing even while the feed as a whole is fresh. A failure the builder recorded as a code bug (not
+upstream) is `builder-bug`, raised at once.
 """
 import datetime
 import hashlib
@@ -174,6 +175,12 @@ def check_record(record_url, manifest, now, limit_hours, problem, result):
         if hours > limit_hours:
             old.append(f"{key} since {info['since']} ({hours:.0f} h: {str(info.get('reason', ''))[:80]})")
     result["stale_releases"] = sorted((record.get("stale") or {}))
+    bugs = sorted(set(record.get("bugs") or []) | {k for k, v in (record.get("stale") or {}).items()
+                                                    if isinstance(v, dict) and v.get("bug")})
+    if bugs:
+        first = (record.get("stale") or {}).get(bugs[0]) or {}
+        problem("builder-bug", f"S2 builder bug for {', '.join(bugs)} (carried forward; the traceback is in "
+                               f"builds/{serial}.json): {str(first.get('reason', ''))[:150]}")
     if old:
         problem("stale-release", f"carried forward for more than {limit_hours:.0f} h: " + "; ".join(old))
 

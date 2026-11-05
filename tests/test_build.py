@@ -364,8 +364,46 @@ class FailSoftTests(unittest.TestCase):
         manifest, record, log = self.build(build.ReleaseOptions(builder=boom), "2026-11-05T17:10:00Z")
         self.assertEqual(manifest["releases"], good["releases"])
         self.assertEqual(manifest["curated"], good["curated"])
-        self.assertIn("S2 failed: disk full", record["stale"]["debian-12"]["reason"])
+        # A RuntimeError is not upstream-shaped: carried forward all the same, but recorded as a builder bug.
+        info = record["stale"]["debian-12"]
+        self.assertEqual(info["reason"], "bug: S2 failed: RuntimeError: disk full")
+        self.assertTrue(info["bug"])
+        self.assertIn("Traceback", info["traceback"])
+        self.assertIn("raise RuntimeError", info["traceback"])
+        self.assertEqual(record["bugs"], sorted(osvfeed.RELEASE_KEYS), "every release failed with it")
         self.assertTrue(any("S2 failed entirely" in w for w in log.warnings))
+
+    def test_upstream_shaped_failure_is_stale_not_a_bug(self):
+        self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+
+        def offline(site_v1, log, previous, today):
+            raise FeedError("https://deb.debian.org/debian/dists/bookworm/InRelease: HTTP 503", transient=True)
+        manifest, record, _ = self.build(build.ReleaseOptions(builder=offline), "2026-11-05T17:10:00Z")
+        self.assertEqual(set(manifest["releases"]), {"debian-12"})
+        self.assertNotIn("bug", record["stale"]["debian-12"])
+        self.assertEqual(record["bugs"], [])
+
+    def test_per_release_bug_from_the_builder(self):
+        self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+        reason = osvfeed.soft_reason("build", KeyError("rows"))
+        self.assertTrue(reason.startswith(osvfeed.BUG_PREFIX))
+        self.assertEqual(osvfeed.soft_reason("archive", OSError("timed out")), "archive: timed out")
+        _, record, _ = self.build(self.failing(reason), "2026-11-05T17:10:00Z")
+        self.assertTrue(record["stale"]["debian-12"]["bug"])
+        self.assertEqual(record["bugs"], ["debian-12"])
+
+    def test_stale_over_seven_days_is_omitted(self):
+        good, _, _ = self.build(helpers.fake_releases(), "2026-11-01T05:10:00Z")
+        manifest, record, _ = self.build(self.failing(), "2026-11-01T17:10:00Z")
+        self.assertEqual(manifest["releases"], good["releases"])
+        manifest, record, _ = self.build(self.failing(), "2026-11-08T17:00:00Z")      # 6.99 days: still carried
+        self.assertEqual(manifest["releases"], good["releases"])
+        manifest, record, log = self.build(self.failing(), "2026-11-08T17:20:00Z")    # over 7 days: omitted
+        self.assertEqual((manifest["releases"], manifest["sources"]), ({}, {}))
+        self.assertEqual(record["stale"]["debian-12"]["since"], "2026-11-01T17:10:00Z")
+        self.assertTrue(record["stale"]["debian-12"]["omitted"])
+        self.assertTrue(any("left out of the manifest" in w for w in log.warnings))
+        build.gate(self.out, build.Log(echo=False))
 
     def test_failure_with_nothing_to_carry(self):
         manifest, record, _ = self.build(self.failing(), "2026-11-05T05:10:00Z")

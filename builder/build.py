@@ -87,8 +87,13 @@ def build_releases(site_v1, log, options, previous, today, now=None, previous_da
     except osvfeed.ConfigError:
         raise
     except Exception as error:  # noqa: BLE001 - fail-soft by design: the curated feed must still publish
-        log.warn(f"S2 failed entirely ({type(error).__name__}: {error}); every release is carried forward")
-        return {}, {}, {key: f"S2 failed: {error}"[:300] for key in osvfeed.RELEASE_KEYS}
+        reason = osvfeed.soft_reason("S2 failed", error)
+        log.warn(f"S2 failed entirely ({reason.splitlines()[0]}); every release is carried forward")
+        return {}, {}, {key: reason for key in osvfeed.RELEASE_KEYS}
+
+
+def _utc(text):
+    return datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
 
 
 def inrelease_dates(past):
@@ -113,12 +118,17 @@ def merge_dates(previous, seen):
     return dict(sorted(out.items()))
 
 
+STALE_OMIT_DAYS = 7     # the app hides findings from data older than 7 days; per release, the feed does too
+
+
 def carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log):
     """For each failed release, put its last published entry (same file, sha256, bytes, rows: from the newest
     builds/ record that names it) back in `releases`, with the file fetched from the live site and checked
     against that sha256. Returns the build record's unsigned `stale` field: {release: {since, reason}}, where
-    `since` is when the release first went stale (kept across builds). A release with no previous entry, or
-    whose file cannot be fetched, is left out and says so."""
+    `since` is when the release first went stale (kept across builds). A builder bug (osvfeed.soft_reason)
+    adds `bug: true` and its `traceback`. A release with no previous entry, whose file cannot be fetched, or
+    stale for more than STALE_OMIT_DAYS, is left out (`omitted: true`), so the app's 7-day freshness rule holds
+    per release."""
     last_stale = (past[0][1].get("stale") or {}) if past else {}
     stale = {}
     for key, reason in sorted(failures.items()):
@@ -129,7 +139,17 @@ def carry_forward(past, failures, releases, sources, site_v1, carry_base, now, l
                 entry = dict(candidate)
                 break
         since = (last_stale.get(key) or {}).get("since") or now
-        stale[key] = {"since": since, "reason": reason[:300]}
+        stale[key] = {"since": since, "reason": reason.splitlines()[0][:300]}
+        if reason.startswith(osvfeed.BUG_PREFIX):
+            stale[key]["bug"] = True
+            stale[key]["traceback"] = reason[:4000]
+            log.warn(f"{key}: BUILDER BUG (the run will end red): {reason.splitlines()[0][:200]}")
+        age = (_utc(now) - _utc(since)).total_seconds() / 86400
+        if age > STALE_OMIT_DAYS:
+            stale[key]["omitted"] = True
+            log.warn(f"{key}: stale since {since} ({age:.1f} days, over {STALE_OMIT_DAYS}): left out of the "
+                     "manifest so the app shows nothing for it rather than old data")
+            continue
         if entry is None:
             stale[key]["omitted"] = True
             log.warn(f"{key}: failed and no previous build published it; left out")
@@ -436,6 +456,7 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
         "carried": carried,
         "stale": stale,
         "inrelease": merge_dates(previous_dates, seen_dates),
+        "bugs": sorted(key for key, info in stale.items() if info.get("bug")),
         "log": log.lines,
         "warnings": log.warnings,
     }

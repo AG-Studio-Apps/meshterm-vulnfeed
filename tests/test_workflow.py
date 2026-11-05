@@ -26,6 +26,36 @@ def sign_check_script():
     return textwrap.dedent("\n".join(lines[first + 1:last])) + "\n"
 
 
+class BuilderBugJob(unittest.TestCase):
+    """A builder bug publishes (fail-soft) and THEN turns the run red: the job needs deploy and record."""
+
+    def text(self):
+        return open(WORKFLOW, encoding="utf-8").read()
+
+    def test_job_shape(self):
+        text = self.text()
+        job = text[text.index("\n  builder-bug:\n"):]
+        self.assertIn("needs: [build, deploy, record]", job)
+        self.assertIn("if: always() && needs.build.outputs.bugs != ''", job)
+        self.assertIn('echo "::error::builder bug in S2', job)
+        self.assertIn("exit 1", job)
+        self.assertIn("bugs: ${{ steps.meta.outputs.bugs }}", text)
+
+    def test_bug_list_one_liner(self):
+        text = self.text()
+        line = next(l for l in text.splitlines() if l.strip().startswith("bugs=$(python3 -I -c"))
+        code = line.split("-c '", 1)[1].rsplit("')", 1)[0]
+        repo = helpers.scratch_repo()
+        self.addCleanup(shutil.rmtree, repo)
+        os.makedirs(os.path.join(repo, "record"))
+        for bugs, want in ((["debian-12", "ubuntu-24.04"], "debian-12 ubuntu-24.04"), ([], ""),
+                           (["x; rm -rf /"], "")):
+            with open(os.path.join(repo, "record", "build.json"), "w") as handle:
+                json.dump({"bugs": bugs}, handle)
+            out = subprocess.run([sys.executable, "-I", "-c", code], cwd=repo, capture_output=True, text=True)
+            self.assertEqual(out.stdout.strip(), want)
+
+
 class SignJobCheck(unittest.TestCase):
     def setUp(self):
         self.repo = helpers.scratch_repo()

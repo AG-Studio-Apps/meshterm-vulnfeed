@@ -61,6 +61,7 @@ jobs:
     outputs:
       serial: ${{ steps.meta.outputs.serial }}
       date: ${{ steps.meta.outputs.date }}
+      bugs: ${{ steps.meta.outputs.bugs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -158,6 +159,10 @@ jobs:
           read -r serial date < <(python3 -c 'import json; m = json.load(open("out/v1/manifest.json")); print(m["serial"], m["generated"][:10])')
           echo "serial=$serial" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
+          # Releases whose S2 failure was a builder bug (not upstream): published as carried forward, then the
+          # `builder-bug` job below turns the run red once deploy and record are done.
+          bugs=$(python3 -I -c 'import json, re; b = json.load(open("record/build.json")).get("bugs") or []; print(" ".join(k for k in b if re.fullmatch(r"[a-z0-9.-]+", k)))')
+          echo "bugs=$bugs" >> "$GITHUB_OUTPUT"
           { echo "### vulnfeed serial $serial ($date)"; echo; echo '```json'; cat out/v1/manifest.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Pack the site for signing
@@ -561,4 +566,23 @@ jobs:
             git pull -q --rebase origin main
           done
           echo "::error::could not push builds/$SERIAL.json; the next build floors its serial on the live manifest"
+          exit 1
+
+  builder-bug:
+    name: Report a builder bug
+    # S2 is fail-soft, so a code bug in the builder still publishes (curated plus the carried-forward
+    # releases). This job runs after deploy and record and fails the run, so the bug is a red run with an
+    # error annotation, not just a log line. The traceback is in builds/<serial>.json (`stale`).
+    needs: [build, deploy, record]
+    if: always() && needs.build.outputs.bugs != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      BUGS: ${{ needs.build.outputs.bugs }}
+      SERIAL: ${{ needs.build.outputs.serial }}
+    steps:
+      - name: Fail with the builder bug
+        run: |
+          echo "::error::builder bug in S2 for: $BUGS (serial $SERIAL published with these releases carried forward; the traceback is in builds/$SERIAL.json)"
           exit 1
