@@ -9,8 +9,11 @@
 #   sign    environment `vulnfeed-signing` (deployments limited to main; NO required reviewer: it is
 #           unattended). Runs NO repository script, only the inline shell below (python3 -I): checks the
 #           environment is still main-only, re-checks the artifact (the committed curated file; every release
-#           entry names an existing v1/r/<allowlisted release>-<16hex>.json with matching sha256 and bytes;
-#           the fixed `sources` shape), signs with VULNFEED_MINISIGN_KEY, verifies, uploads the Pages artifact.
+#           entry names an existing v1/r/<allowlisted release>-<16hex>.json with matching sha256, bytes and
+#           row count; the fixed `sources` shape; every other file a carry-over that a committed builds/
+#           record names with that sha256, retired releases only as carry-overs), signs with
+#           VULNFEED_MINISIGN_KEY, verifies, uploads the Pages artifact. S2 is fail-soft (a failed release
+#           keeps its previous file), so this job also signs a manifest whose releases are all carried.
 #   deploy  actions/deploy-pages.
 #   smoke   no secrets, no repository script: fetches the live pair and verifies it.
 #   record  commits builds/<serial>.json (the manifest and the build log) to main: a history, and the repo
@@ -216,7 +219,8 @@ jobs:
           print("vulnfeed-signing: deployments limited to main.")
           PY
 
-      # Only the committed curated file and the public keys: no scripts.
+      # Only the committed curated file, the public keys and the build records (for the carried files): no
+      # scripts.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -224,6 +228,7 @@ jobs:
           sparse-checkout: |
             /curated/curated.json
             /keys/
+            /builds/
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -277,10 +282,14 @@ jobs:
           allow = {"ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                    "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
                    "debian-11", "debian-12", "debian-13"}
+          # Releases dropped from the feed (builder/osvfeed.py RETIRED_RELEASES): never a manifest entry, their
+          # old files allowed only as carry-overs (checked against builds/ below) until they age out.
+          retired = set()
           iso = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
           rels = m.get("releases")
-          if not isinstance(rels, dict) or not rels:
-              problems.append("releases is not a non-empty object")
+          # Empty is allowed (S2 is fail-soft: a feed with no release ever built still publishes curated).
+          if not isinstance(rels, dict):
+              problems.append("releases is not an object")
               rels = {}
           for key, e in sorted(rels.items()):
               if key not in allow:
@@ -305,9 +314,18 @@ jobs:
                   problems.append(f"release {key}: {name} is not JSON"); continue
               if not isinstance(body, dict) or body.get("release") != key \
                       or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
-                  problems.append(f"release {key}: {name} does not name its release")
+                  problems.append(f"release {key}: {name} does not name its release"); continue
+              try:
+                  count = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
+              except (AttributeError, TypeError):
+                  count = None
+              if count != e["rows"]:
+                  problems.append(f"release {key}: {name} has {count} rows, the manifest says {e['rows']}")
           src = m.get("sources")
-          if not isinstance(src, dict) or set(src) != {"osv", "archive", "baseline"}:
+          if not rels:
+              if src != {}:
+                  problems.append("sources is not empty, with no releases")
+          elif not isinstance(src, dict) or set(src) != {"osv", "archive", "baseline"}:
               problems.append("sources keys are not exactly osv, archive, baseline")
           else:
               osv, arc, base = src["osv"], src["archive"], src["baseline"]
@@ -329,6 +347,16 @@ jobs:
           else:
               published = open(os.path.join(site, "v1", cur["file"]), "rb").read()
               if published != committed: problems.append("the published curated file is not the committed one")
+          # Every file the manifest does not name is a carry-over: it must be one a committed builds/ record
+          # named, with that record's sha256.
+          recorded = {}
+          for rec_name in sorted(os.listdir("builds")) if os.path.isdir("builds") else []:
+              if re.fullmatch(r"[1-9][0-9]*\.json", rec_name):
+                  rm = (json.load(open(os.path.join("builds", rec_name))).get("manifest") or {})
+                  for ref in [rm.get("curated") or {}] + list((rm.get("releases") or {}).values()):
+                      if ref.get("file"):
+                          recorded.setdefault(ref["file"], set()).add(ref.get("sha256"))
+          named = {cur.get("file")} | {e.get("file") for e in rels.values() if isinstance(e, dict)}
           for root, _, files in os.walk(site):
               for name in files:
                   rel = os.path.relpath(os.path.join(root, name), site)
@@ -337,8 +365,12 @@ jobs:
                   carried = re.fullmatch(r"v1/r/([a-z0-9.-]+)-[0-9a-f]{16}\.json", rel)
                   if rel not in (".nojekyll", "v1/manifest.json") \
                           and not re.fullmatch(r"v1/curated-[0-9a-f]{16}\.json", rel) \
-                          and not (carried and carried.group(1) in allow):
+                          and not (carried and carried.group(1) in allow | retired):
                       problems.append(f"unexpected file {rel}")
+                  elif rel.startswith("v1/") and rel != "v1/manifest.json" and rel[3:] not in named:
+                      digest = hashlib.sha256(open(os.path.join(root, name), "rb").read()).hexdigest()
+                      if digest not in recorded.get(rel[3:], set()):
+                          problems.append(f"carried file {rel} matches no builds/ record")
           for p in problems:
               print(f"::error::Refusing to sign: {p}")
           if problems:

@@ -37,10 +37,69 @@ class SignJobCheck(unittest.TestCase):
         with open(self.script, "w") as handle:
             handle.write(sign_check_script())
 
-    def run_check(self):
+    def run_check(self, script=None):
         env = dict(os.environ, SITE=self.out, SERIAL=str(self.manifest["serial"]), DATE=NOW[:10])
-        return subprocess.run([sys.executable, "-I", self.script], cwd=self.repo, env=env,
+        return subprocess.run([sys.executable, "-I", script or self.script], cwd=self.repo, env=env,
                               capture_output=True, text=True)
+
+    def test_retired_set_matches_the_builder(self):
+        text = open(WORKFLOW, encoding="utf-8").read()
+        match = re.search(r"retired = (set\(\)|\{[^}]*\})", text)
+        self.assertIsNotNone(match)
+        self.assertEqual(set(re.findall(r'"([a-z0-9.-]+)"', match.group(1))), set(osvfeed.RETIRED_RELEASES))
+
+    def test_rows_must_match_the_body(self):
+        path = os.path.join(self.out, "v1", "manifest.json")
+        with open(path) as handle:
+            manifest = json.load(handle)
+        manifest["releases"]["debian-12"]["rows"] = 3
+        with open(path, "w") as handle:
+            json.dump(manifest, handle)
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has 2 rows, the manifest says 3", result.stdout)
+
+    def test_carried_files_must_match_a_build_record(self):
+        old = os.path.join(self.out, "v1", "r", "debian-12-00000000000000aa.json")
+        with open(old, "w") as handle:
+            handle.write("{}")
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("matches no builds/ record", result.stdout)
+        digest = __import__("hashlib").sha256(b"{}").hexdigest()
+        record = {"serial": 1, "manifest": {"releases": {"debian-12": {"file": "r/debian-12-00000000000000aa.json",
+                                                                       "sha256": digest}}}}
+        with open(os.path.join(self.repo, "builds", "1.json"), "w") as handle:
+            json.dump(record, handle)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_retiring_a_release_end_to_end(self):
+        """The README steps: drop the release from RELEASES (here: the sign job's allow set) and add it to
+        RETIRED_RELEASES / `retired`. The next builds publish no entry for it; its last file is allowed only as
+        a carry-over of a recorded build; a manifest entry for it is refused."""
+        text = sign_check_script().replace('"debian-11", "debian-12", "debian-13"}', '"debian-11", "debian-13"}')
+        text = text.replace("retired = set()", 'retired = {"debian-12"}')
+        script = os.path.join(self.repo, "retired-check.py")
+        with open(script, "w") as handle:
+            handle.write(text)
+        self.assertIn("'debian-12' is not on the allowlist", self.run_check(script).stdout)
+        entry = self.manifest["releases"]["debian-12"]
+        with open(os.path.join(self.repo, "builds", "1.json"), "w") as handle:
+            json.dump({"serial": 1, "manifest": self.manifest}, handle)
+        retired = build.ReleaseOptions(builder=lambda site_v1, log, previous, today: ({}, {}, {}))
+        manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, None, self.out_copy(),
+                                  build.Log(echo=False), retired)
+        self.manifest = manifest
+        self.assertEqual(manifest["releases"], {})
+        self.assertTrue(os.path.exists(os.path.join(self.out, "v1", entry["file"])), "carried over")
+        result = self.run_check(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def out_copy(self):
+        live = os.path.join(self.repo, "live")
+        shutil.copytree(self.out, live)
+        return live
 
     def test_allowlist_matches_the_builder(self):
         text = open(WORKFLOW, encoding="utf-8").read()
