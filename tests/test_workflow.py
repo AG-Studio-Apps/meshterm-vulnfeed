@@ -108,7 +108,7 @@ class SignJobCheck(unittest.TestCase):
         """The README steps: drop the release from RELEASES (here: the sign job's allow set) and add it to
         RETIRED_RELEASES / `retired`. The next builds publish no entry for it; its last file is allowed only as
         a carry-over of a recorded build; a manifest entry for it is refused."""
-        text = sign_check_script().replace('"debian-11", "debian-12", "debian-13"}', '"debian-11", "debian-13"}')
+        text = sign_check_script().replace('"debian-11", "debian-12", "debian-13",', '"debian-11", "debian-13",')
         text = text.replace("retired = set()", 'retired = {"debian-12"}')
         script = os.path.join(self.repo, "retired-check.py")
         with open(script, "w") as handle:

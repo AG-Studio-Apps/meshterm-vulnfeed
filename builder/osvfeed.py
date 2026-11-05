@@ -1,4 +1,5 @@
-"""S2: the OSV release files for dpkg releases (Ubuntu and Debian). Python 3 stdlib only.
+"""S2 + S4: the OSV release files for dpkg releases (Ubuntu and Debian) and apk releases (Alpine). Python 3
+stdlib only.
 
 meshTerm docs/plan-host-cve-scanner.md sections 3.1-3.3 (the rules), 4.1 (the file) and 4.2 (the gates).
 
@@ -29,6 +30,22 @@ Then, per release, with the archive Sources of every pocket and component loaded
    Medium.
    Only ids that are High or Critical stay; a row with none left is dropped.
 8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`.
+
+Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
+1. Each range's events are sorted by apk version ("0" lowest) and walked as OSV does: introduced opens,
+   fixed closes; each (introduced, the FIRST fixed after it) is one row. A fixed with no open introduced
+   (the 2nd/3rd fixed of [0, f1, f2, f3], or a fixed below its introduced) is dropped and counted, not a
+   failure. If any value of the range is not a valid apk version the events are walked in the order given,
+   and resolve() rejects the pairs holding the bad value.
+4. A fixed or introduced value that is date-shaped or not a valid apk version (builder/apkver.py) is
+   rejected (the same REJECT_LIMIT gate).
+5, 6. No baseline cut, no leading-token check and no published check: Alpine fixes come from secdb, built
+   from the branch's aports secfixes (so a fix is in that branch's repository), and there is no
+   release-day archive to cut against. APKINDEX is RSA-signed, which the stdlib cannot verify.
+7. Severity: the highest CVSS 3.x/4.0 score, else Medium.
+8. Kernel origins (APK_KERNELS) fold with a null publishedDate: OSV Alpine has no fix date (a record's
+   `published` is the CVE's NVD date, older than the fix), and the app never counts a pending kernel restart
+   from a null date.
 """
 import collections
 import datetime
@@ -43,6 +60,7 @@ import tempfile
 import time
 import zipfile
 
+import apkver
 import cvss
 import netfetch
 from dpkgver import DpkgVersion, VersionError, sort_key
@@ -65,9 +83,16 @@ DEBIAN_SECURITY = "https://security.debian.org/debian-security"
 SNAPSHOT = "https://snapshot.debian.org/archive/debian"
 
 REJECT_LIMIT = 0.005        # rejected fixed versions, per OSV ecosystem, as a share of fixed rows
+# Alpine rows whose `introduced` (an UPSTREAM version in OSV Alpine) apk cannot parse, gated on their own:
+# ImageMagick's upstream `7.0.0-0` / `6.9.10-54` scheme is 95% of them (measured 2026-11-05: 104 of 17,856
+# rows, 0.58%, which alone is over REJECT_LIMIT). They are still rejected (dropped and counted).
+INTRODUCED_REJECT_LIMIT = 0.02
 ROW_SWING = 0.30            # per-release row count change allowed against the previous build
 ROW_SWING_FLOOR = 25        # ... or this many rows, whichever is larger (small files swing by single rows)
 HIGH = cvss.HIGH
+
+
+_OSV_ZIPS = {"ubuntu": "Ubuntu", "debian": "Debian", "alpine": "Alpine"}
 
 
 class Release:
@@ -77,7 +102,17 @@ class Release:
 
     @property
     def osv_zip(self):
-        return "Ubuntu" if self.family == "ubuntu" else "Debian"
+        return _OSV_ZIPS[self.family]
+
+    @property
+    def format(self):
+        """The manifest `format`: "apk" for Alpine, "dpkg" for Ubuntu and Debian."""
+        return "apk" if self.family == "alpine" else "dpkg"
+
+    @property
+    def has_archive(self):
+        """Whether the release has a Sources archive (and a baseline) to load. Alpine has neither (S4)."""
+        return self.family != "alpine"
 
     @property
     def base_key(self):
@@ -109,10 +144,19 @@ RELEASES = [
     Release("debian-11", "debian", "Debian:11", "bullseye", snapshot="20210815T000000Z"),
     Release("debian-12", "debian", "Debian:12", "bookworm", snapshot="20230611T000000Z"),
     Release("debian-13", "debian", "Debian:13", "trixie", snapshot="20250810T000000Z"),
+    # Alpine 3.20+ (plan 3.4). 3.20 (EOL 2026-04-01) and 3.21 (EOL 2026-11-01) are past end of life per
+    # alpinelinux.org/releases.json; kept for now (their hosts still exist), dropping them is open.
+    Release("alpine-3.20", "alpine", "Alpine:v3.20", None),
+    Release("alpine-3.21", "alpine", "Alpine:v3.21", None),
+    Release("alpine-3.22", "alpine", "Alpine:v3.22", None),
+    Release("alpine-3.23", "alpine", "Alpine:v3.23", None),
+    Release("alpine-3.24", "alpine", "Alpine:v3.24", None),
 ]
 RELEASE_KEYS = tuple(r.key for r in RELEASES)
 
 _SOURCE_NAME = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")
+# Alpine origin names also use `_` (wpa_supplicant, mini_httpd, sdl2_image).
+_ORIGIN_NAME = re.compile(r"^[a-z0-9][a-z0-9._+-]*$")
 _DATE_SHAPED = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 _ADVISORY = re.compile(r"^(USN|DSA|DLA|DTSA)-")
@@ -127,8 +171,18 @@ _AVAIL_EXCLUDED = ("Livepatch subscription required", "Available with Ubuntu Pro
 _NON_KERNEL = re.compile(r"^linux-(firmware.*|base|atm|sgx.*|tools-common|doc)$")
 
 
-def is_kernel(source):
+# Alpine kernel origins. NOT linux-pam (userspace PAM), linux-headers, linux-firmware*, linux-tools.
+APK_KERNELS = frozenset({"linux-lts", "linux-edge", "linux-rpi", "linux-virt", "linux-stable"})
+
+
+def is_kernel(source, fmt="dpkg"):
+    if fmt == "apk":
+        return source in APK_KERNELS
     return (source == "linux" or source.startswith("linux-")) and not _NON_KERNEL.match(source)
+
+
+def name_ok(source, fmt="dpkg"):
+    return isinstance(source, str) and bool((_ORIGIN_NAME if fmt == "apk" else _SOURCE_NAME).match(source))
 
 
 class ShapeError(Exception):
@@ -165,6 +219,63 @@ def range_pairs(affected):
                 introduced = None
             else:
                 raise ShapeError(f"event kind {kind}")
+    return pairs
+
+
+def _event_list(rng):
+    """[(kind, value)] of one range, after the checks every family shares."""
+    if not isinstance(rng, dict) or rng.get("type") != "ECOSYSTEM":
+        raise ShapeError(f"range type {rng.get('type') if isinstance(rng, dict) else rng!r}")
+    events = rng.get("events")
+    if not isinstance(events, list) or not events:
+        raise ShapeError("no events")
+    out = []
+    for event in events:
+        if not isinstance(event, dict) or len(event) != 1:
+            raise ShapeError(f"event {event!r}")
+        (kind, value), = event.items()
+        if not isinstance(value, str) or not value:
+            raise ShapeError(f"event value {value!r}")
+        if kind not in ("introduced", "fixed"):
+            raise ShapeError(f"event kind {kind}")
+        out.append((kind, value))
+    return out
+
+
+def _apk_event_key(event):
+    kind, value = event
+    return (0, 0) if kind == "introduced" and value == "0" else (1, apkver.sort_key(value))
+
+
+def apk_range_pairs(affected, counters):
+    """[(introduced, fixed)] for one Alpine affected[] entry (rule 1 of the Alpine notes above). Dropped fixed
+    events are counted in `counters`: `redundant fixed` (a later fixed of an already closed range) and `empty
+    range (fixed below introduced)` (a fixed before any introduced, such as prosody [13.0.0, 0.12.6-r0)).
+    Raises ShapeError on any other shape."""
+    ranges = affected.get("ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise ShapeError("no ranges")
+    pairs = []
+    for rng in ranges:
+        events = _event_list(rng)
+        counters["shape [" + ", ".join("introduced 0" if (k, v) == ("introduced", "0") else
+                                       "introduced X" if k == "introduced" else k for k, v in events) + "]"] += 1
+        if all((k == "introduced" and v == "0") or (apkver.validate(v) and not _DATE_SHAPED.match(v))
+               for k, v in events):
+            events = sorted(events, key=_apk_event_key)
+        else:
+            counters["ranges walked unsorted (a bad version)"] += 1
+        introduced, closed_any = None, False
+        for kind, value in events:
+            if kind == "introduced":
+                if introduced is not None:
+                    raise ShapeError("introduced twice without a fixed between")
+                introduced = value
+            elif introduced is None:
+                counters["redundant fixed" if closed_any else "empty range (fixed below introduced)"] += 1
+            else:
+                pairs.append((introduced, value))
+                introduced, closed_any = None, True
     return pairs
 
 
@@ -269,6 +380,8 @@ def ingest(zip_path, releases, log):
             rid = record.get("id", "")
             upstream = [u for u in (record.get("upstream") or []) + (record.get("aliases") or [])
                         if isinstance(u, str) and _CVE.match(u)]
+            if not upstream and rid.startswith("ALPINE-") and _CVE.match(rid[len("ALPINE-"):]):
+                upstream = [rid[len("ALPINE-"):]]   # Alpine ids are upstream CVEs: never ship ALPINE-CVE-*
             ids = sorted(set(upstream)) or [rid]
             is_adv = bool(_ADVISORY.match(rid))
             sev = severity_of_record(record, stats)
@@ -288,8 +401,14 @@ def ingest(zip_path, releases, log):
                 stats[f"{release.key}: affected entries"] += 1
                 source = package.get("name")
                 try:
-                    pairs = range_pairs(affected)
-                    if not isinstance(source, str) or not _SOURCE_NAME.match(source):
+                    if release.format == "apk":
+                        dropped = collections.Counter()
+                        pairs = apk_range_pairs(affected, dropped)
+                        for reason, count in dropped.items():
+                            stats[f"{release.key}: {reason}"] += count
+                    else:
+                        pairs = range_pairs(affected)
+                    if not name_ok(source, release.format):
                         raise ShapeError(f"source name {source!r}")
                 except ShapeError as error:
                     stats[f"{release.key}: unknown range shape"] += 1
@@ -628,6 +747,51 @@ def resolve(release, cands, info, archive, baseline, counters, decisions):
     return rows, examples, dropped
 
 
+def resolve_apk(release, cands, info, counters, decisions):
+    """Rules for one Alpine release (the Alpine notes at the top): reject bad versions, severity, kernel fold.
+    Same return shape as resolve()."""
+    rows, examples, dropped = [], [], []
+    for (source, introduced, fixed), cand in sorted(cands.items()):
+        reason = None
+        if _DATE_SHAPED.match(fixed) or (introduced != "0" and _DATE_SHAPED.match(introduced)):
+            reason = "date-shaped"
+        elif not apkver.validate(fixed):
+            reason = "fixed not an apk version"
+        elif introduced != "0" and not apkver.validate(introduced):
+            reason = "introduced not an apk version"
+        if reason:
+            counters["rejected"] += 1
+            counters[f"rejected: {reason}"] += 1
+            dropped.append([source, introduced, fixed, f"rejected: {reason}"])
+            if len(examples) < 8:
+                examples.append(f"{source} [{introduced!r}, {fixed!r}] ({reason}; "
+                                f"{', '.join(sorted(cand.ids))[:60]})")
+            continue
+        kept, rules, best = {}, {}, -1
+        for cve in cand.ids:
+            band, rule = severity(release, cve, cand, info)
+            decisions[rule] += 1
+            best = max(best, band)
+            if band >= HIGH:
+                kept[cve] = band
+                rules[cve] = rule
+        if not kept:
+            counters["below High (dropped)"] += 1
+            dropped.append([source, introduced, fixed, "below High (dropped)", best])
+            continue
+        counters["shipped"] += 1
+        kernel = is_kernel(source, "apk")
+        if kernel:
+            counters["kernel rows"] += 1
+        # `date` is the CVE's record date, kept in the intermediates only; the file carries no package date and
+        # a null kernel date (no fix date in OSV Alpine).
+        rows.append({"source": source, "introduced": introduced, "fixed": fixed,
+                     "severity": max(kept.values()), "ids": sorted(kept), "kernel": kernel,
+                     "date": cand.rec_date, "dateSource": "record (CVE, not the fix)", "modified": cand.modified,
+                     "rules": dict(sorted(rules.items()))})
+    return rows, examples, dropped
+
+
 def severity(release, cve, cand, info):
     """(band, rule) for one id of one row, by the release family's chain (plan 3.2)."""
     ubuntu, score = info.get(cve, (None, None))
@@ -641,6 +805,8 @@ def severity(release, cve, cand, info):
         return cvss.MEDIUM, "default medium"
     if score is not None:
         return cvss.band(score), "cvss"
+    if release.family == "alpine":
+        return cvss.MEDIUM, "default medium"
     if cve in cand.advisory_ids:
         return HIGH, "dsa/dla exists -> high"
     return cvss.MEDIUM, "default medium"
@@ -648,20 +814,35 @@ def severity(release, cve, cand, info):
 
 def release_body(release, rows):
     """The shipped JSON object (plan 4.1)."""
+    apk = release.format == "apk"
     pkgs, kernel = collections.defaultdict(list), collections.defaultdict(list)
     for row in rows:
         if row["kernel"]:
             kernel[row["source"]].append([row["introduced"], row["fixed"], row["severity"], len(row["ids"]),
-                                          row["date"]])
+                                          None if apk else row["date"]])
         else:
             pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"]])
-    order = sort_rows
-    return {"release": release.key, "format": "dpkg", "keyedBy": "source",
-            "pkgs": {k: order(v) for k, v in sorted(pkgs.items())},
-            "kernel": {k: order(v) for k, v in sorted(kernel.items())}}
+    fmt = release.format
+    return {"release": release.key, "format": fmt, "keyedBy": "origin" if apk else "source",
+            "pkgs": {k: sort_rows(v, fmt) for k, v in sorted(pkgs.items())},
+            "kernel": {k: sort_rows(v, fmt) for k, v in sorted(kernel.items())}}
 
 
-def _version_or_zero_cmp(a, b):
+def version_cmp(fmt):
+    """The comparison (a, b) -> -1/0/1 of a release format."""
+    if fmt == "apk":
+        return apkver.compare
+    return lambda a, b: DpkgVersion.parse(a)._cmp(DpkgVersion.parse(b))
+
+
+def version_ok(fmt, text):
+    """A valid version of the format, not date-shaped (what check_release_body and the rules accept)."""
+    if not isinstance(text, str) or _DATE_SHAPED.match(text):
+        return False
+    return apkver.validate(text) if fmt == "apk" else _cmp_ok(text) is not None
+
+
+def _version_or_zero_cmp(a, b, fmt="dpkg"):
     """Compares two `introduced` values: "0" is below every version."""
     if a == b:
         return 0
@@ -669,17 +850,22 @@ def _version_or_zero_cmp(a, b):
         return -1
     if b == "0":
         return 1
-    return DpkgVersion.parse(a)._cmp(DpkgVersion.parse(b))
+    return version_cmp(fmt)(a, b)
 
 
-def sort_rows(rows):
-    """Rows ordered by fixed version, then introduced."""
+def sort_rows(rows, fmt="dpkg"):
+    """Rows ordered by fixed version, then introduced (then the text, so equal apk versions sort stably)."""
+    cmp = version_cmp(fmt)
     return sorted(rows, key=functools.cmp_to_key(
-        lambda a, b: DpkgVersion.parse(a[1])._cmp(DpkgVersion.parse(b[1])) or _version_or_zero_cmp(a[0], b[0])))
+        lambda a, b: cmp(a[1], b[1]) or _version_or_zero_cmp(a[0], b[0], fmt)
+        or (a[1] > b[1]) - (a[1] < b[1]) or (a[0] > b[0]) - (a[0] < b[0])))
 
 
 _ID = re.compile(r"^(CVE-\d{4}-\d{4,}|(USN|DSA|DLA|DTSA|LSN)-\d+(-\d+)?|(UBUNTU|DEBIAN)-CVE-\d{4}-\d{4,})$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Per format: (keyedBy, id pattern). apk ids are upstream CVEs only.
+_BODY_FORMATS = {"dpkg": ("source", _ID), "apk": ("origin", _CVE)}
+FORMAT_OF = {r.key: r.format for r in RELEASES}
 
 
 def check_release_body(body, key, entry):
@@ -688,15 +874,17 @@ def check_release_body(body, key, entry):
         raise FeedError(f"{entry['file']}: {why}")
     if not isinstance(body, dict) or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
         fail("keys must be release, format, keyedBy, pkgs, kernel")
-    if body["release"] != key or body["format"] != entry["format"] or body["format"] != "dpkg" \
-            or body["keyedBy"] != "source":
+    fmt = entry["format"]
+    if body["release"] != key or body["format"] != fmt or fmt not in _BODY_FORMATS \
+            or FORMAT_OF.get(key, fmt) != fmt or body["keyedBy"] != _BODY_FORMATS[fmt][0]:
         fail("release/format/keyedBy do not match the manifest")
+    id_re = _BODY_FORMATS[fmt][1]
     count = 0
     for section, width in (("pkgs", 4), ("kernel", 5)):
         if not isinstance(body[section], dict):
             fail(f"{section} is not an object")
         for source, rows in body[section].items():
-            if not _SOURCE_NAME.match(source) or (section == "kernel") != is_kernel(source):
+            if not name_ok(source, fmt) or (section == "kernel") != is_kernel(source, fmt):
                 fail(f"bad {section} source {source!r}")
             if not isinstance(rows, list) or not rows:
                 fail(f"{source}: no rows")
@@ -705,19 +893,21 @@ def check_release_body(body, key, entry):
                 if not isinstance(row, list) or len(row) != width:
                     fail(f"{source}: row {row!r} is not {width} fields")
                 introduced, fixed, sev = row[0], row[1], row[2]
-                if not (introduced == "0" or _cmp_ok(introduced)) or not isinstance(fixed, str) \
-                        or _cmp_ok(fixed) is None or _DATE_SHAPED.match(fixed):
+                intro_ok = introduced == "0" or (version_ok(fmt, introduced) if fmt == "apk"
+                                                 else _cmp_ok(introduced) is not None)
+                if not intro_ok or not version_ok(fmt, fixed):
                     fail(f"{source}: bad version in {row!r}")
                 if type(sev) is not int or sev not in (cvss.HIGH, cvss.CRITICAL):
                     fail(f"{source}: severity {sev!r} is not High or Critical")
                 if section == "pkgs":
                     ids = row[3]
                     if not isinstance(ids, list) or not ids or ids != sorted(set(ids)) \
-                            or not all(isinstance(i, str) and _ID.match(i) for i in ids):
+                            or not all(isinstance(i, str) and id_re.match(i) for i in ids):
                         fail(f"{source}: bad ids {ids!r}")
                 else:
+                    # apk kernel rows always carry a null date (no fix date in OSV Alpine).
                     if type(row[3]) is not int or row[3] < 1 or not (row[4] is None or (
-                            isinstance(row[4], str) and _DAY.match(row[4]))):
+                            fmt == "dpkg" and isinstance(row[4], str) and _DAY.match(row[4]))):
                         fail(f"{source}: bad kernel row {row!r}")
     if count != entry["rows"]:
         fail(f"{count} rows, the manifest says {entry['rows']}")
@@ -754,6 +944,64 @@ def read_inventory(path):
             if old is None or DpkgVersion.parse(version) > DpkgVersion.parse(old):
                 out[source] = version
     return out
+
+
+def read_apk_inventory(path):
+    """{origin: highest version} from the app's Pro probe listing of /lib/apk/db/installed (`grep -E
+    "^([PVo]:|$)"`: the P: name, V: version and o: origin lines and the blank record separators, in file
+    order). A record's origin is its `o:`, else its name; per origin the HIGHEST version (by apkver) of its
+    packages counts (plan 3.3). `#` lines are comments."""
+    out = {}
+    record = {}
+
+    def flush():
+        if not record:
+            return
+        name, version = record.get("P"), record.get("V")
+        if not name or not version:
+            raise FeedError(f"{os.path.basename(path)}: a record without P: or V: ({record!r:.80})")
+        origin = record.get("o") or name
+        old = out.get(origin)
+        if old is None or apkver.compare(version, old) > 0:
+            out[origin] = version
+        record.clear()
+
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                continue
+            if not line:
+                flush()
+                continue
+            if len(line) < 2 or line[1] != ":" or line[0] not in "PVo":
+                raise FeedError(f"{os.path.basename(path)}: bad line {line[:60]!r}")
+            if line[0] in record:
+                raise FeedError(f"{os.path.basename(path)}: {line[0]}: twice in one record")
+            record[line[0]] = line[2:]
+    flush()
+    return out
+
+
+def read_case_inventory(path, fmt):
+    return read_apk_inventory(path) if fmt == "apk" else read_inventory(path)
+
+
+def apk_hits(body, inventory):
+    """{origin: [fixed, ...]} for the package rows of an apk release FILE that the inventory is in: a row
+    matches when introduced <= installed < fixed (introduced "0" always holds). Kernel rows are not counted.
+    This is exactly the app's matcher, on the shipped file (Alpine rows carry no fix date to filter on)."""
+    hits = collections.defaultdict(list)
+    for origin, rows in body["pkgs"].items():
+        installed = inventory.get(origin)
+        if installed is None:
+            continue
+        for introduced, fixed, _, _ in rows:
+            if introduced != "0" and apkver.compare(installed, introduced) < 0:
+                continue
+            if apkver.compare(installed, fixed) < 0:
+                hits[origin].append(fixed)
+    return dict(hits)
 
 
 def published_before(row, capture):
@@ -848,15 +1096,21 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
     more unexpected sources, or any unexpected hit whose High came from a HEURISTIC_RULES rule (per-id
     provenance is in each row's `rules`), fail."""
     failures = []
+    fmt = FORMAT_OF.get(key, "dpkg")
     for case in golden_cases(golden_dir):
         if case["release"] != key:
             continue
-        inventory = read_inventory(os.path.join(golden_dir, case["fixture"]))
-        at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
-        hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)
+        inventory = read_case_inventory(os.path.join(golden_dir, case["fixture"]), fmt)
+        if fmt == "apk":
+            # No fix dates and no archive at capture: the shipped rows, matched as the app does.
+            hits, unarchived = apk_hits(release_body(Release(key, "alpine", None, None), rows), inventory), []
+        else:
+            at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
+            hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)
         got = set(hits)
         expected = set(case.get("exact", case.get("atLeast", [])))
-        detail = ", ".join(f"{s} {inventory[s]} < {max(hits[s], key=sort_key)}" for s in sorted(got)) or "none"
+        key_of = apkver.sort_key if fmt == "apk" else sort_key
+        detail = ", ".join(f"{s} {inventory[s]} < {max(hits[s], key=key_of)}" for s in sorted(got)) or "none"
         if expected - got:
             failures.append(f"golden {case['fixture']}: missing {sorted(expected - got)} [{detail}]")
         if unarchived:
@@ -877,8 +1131,8 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
                 log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
                          "fix that was in the archive at capture; update expected.json if it is right)")
         if not failures:
-            log.info(f"golden {case['fixture']} ({key}, before {case['capture']}): {len(got)} source(s) "
-                     f"flagged: {detail}")
+            when = "every shipped row, no fix dates" if fmt == "apk" else f"before {case['capture']}"
+            log.info(f"golden {case['fixture']} ({key}, {when}): {len(got)} source(s) flagged: {detail}")
     return failures
 
 
@@ -1012,7 +1266,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
 
     archives, baselines = {}, {}
     for release in releases:
-        if release.esm or release.key in archives:
+        if release.esm or release.key in archives or not release.has_archive:
             continue
         baseline_file = None
         if release.family == "debian":
@@ -1064,21 +1318,28 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 log.info(f"osv {zip_name}: {key} {value}")
         if shapes:
             log.info(f"osv {zip_name}: unknown shapes, e.g. " + "; ".join(shapes[:5]))
-        zip_fixed = zip_rejected = 0
+        zip_fixed = zip_rejected = zip_intro = 0
         pending = {}
         for release in members:
             try:
                 pending[release.key] = _one_release(release, candidates[release.key], info, stats, archives,
                                                     baselines, work, log)
                 zip_fixed += len(candidates[release.key])
-                zip_rejected += pending[release.key]["rejected"]
+                zip_rejected += pending[release.key]["rejected"] - pending[release.key]["rejected_intro"]
+                zip_intro += pending[release.key]["rejected_intro"]
             except _SOFT as error:
                 fail([release.key], soft_reason("build", error))
         share = zip_rejected / zip_fixed if zip_fixed else 0.0
-        log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})")
+        intro_share = zip_intro / zip_fixed if zip_fixed else 0.0
+        log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})"
+                 + (f", and {zip_intro} for an unparseable introduced ({intro_share:.3%})" if zip_intro else ""))
         if share >= REJECT_LIMIT:
             fail(list(pending), f"osv {zip_name}: {share:.2%} of fixed versions rejected, the limit is "
                                 f"{REJECT_LIMIT:.1%}")
+            continue
+        if intro_share >= INTRODUCED_REJECT_LIMIT:
+            fail(list(pending), f"osv {zip_name}: {intro_share:.2%} of rows rejected for an unparseable "
+                                f"introduced, the limit is {INTRODUCED_REJECT_LIMIT:.1%}")
             continue
         for key, built in sorted(pending.items()):
             problems = []
@@ -1086,7 +1347,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 problems.append(f"{built['unknown']} unknown range shape(s) (fail closed)")
             if len(built["data"]) > FILE_CAP:
                 problems.append(f"{len(built['data'])} bytes, over the {FILE_CAP}-byte cap")
-            entry = {"format": "dpkg", "file": "r/" + content_name(key, built["data"]),
+            entry = {"format": built["format"], "file": "r/" + content_name(key, built["data"]),
                      "sha256": sha256_hex(built["data"]), "bytes": len(built["data"]), "rows": built["count"]}
             try:
                 check_release_body(json.loads(built["data"]), key, entry)
@@ -1110,7 +1371,11 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
 def _one_release(release, cands, info, stats, archives, baselines, work, log):
     counters, decisions = collections.Counter(), collections.Counter()
     base = release.base_key
-    rows, examples, dropped = resolve(release, cands, info, archives[base], baselines[base], counters, decisions)
+    if release.has_archive:
+        rows, examples, dropped = resolve(release, cands, info, archives[base], baselines[base], counters,
+                                          decisions)
+    else:
+        rows, examples, dropped = resolve_apk(release, cands, info, counters, decisions)
     body = release_body(release, rows)
     data = body_bytes(body)
     summary = {k.split(": ", 1)[1]: v for k, v in stats.items() if k.startswith(release.key + ": ")}
@@ -1131,4 +1396,5 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         json.dump({"release": release.key, "counters": counters, "decisions": decisions,
                    "osv": summary, "rows": rows, "dropped": dropped}, handle, indent=0, sort_keys=True)
     return {"rows": rows, "data": data, "count": row_count(body), "rejected": counters["rejected"],
+            "format": release.format, "rejected_intro": counters["rejected: introduced not an apk version"],
             "unknown": stats[f"{release.key}: unknown range shape"]}

@@ -379,8 +379,12 @@ class Golden(unittest.TestCase):
         directory = osvfeed.GOLDEN_DIR
         cases = osvfeed.golden_cases(directory)
         self.assertEqual({c["fixture"] for c in cases},
-                         {"ubuntu-24.04-stock.tsv", "debian-12-stock.tsv", "debian-12.0-20230612.tsv"})
+                         {"ubuntu-24.04-stock.tsv", "debian-12-stock.tsv", "debian-12.0-20230612.tsv",
+                          "alpine-3.20-stock.apk.txt", "alpine-3.20.0-20240522.apk.txt",
+                          "alpine-3.24-stock.apk.txt"})
         for case in cases:
+            if osvfeed.FORMAT_OF[case["release"]] == "apk":
+                continue    # tests/test_alpine.py
             for name in (case["fixture"], case["archive"]):
                 path = os.path.join(directory, name)
                 self.assertLess(os.path.getsize(path), 64 * 1024, path)

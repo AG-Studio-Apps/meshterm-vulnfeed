@@ -16,7 +16,7 @@
       "description": "Empty with no releases; otherwise exactly osv (newest OSV `modified` per ecosystem zip), archive (each suite's Release Date) and baseline (each release's release-day date).",
       "additionalProperties": false,
       "properties": {
-        "osv": {"type": "object", "propertyNames": {"enum": ["Debian", "Ubuntu"]},
+        "osv": {"type": "object", "propertyNames": {"enum": ["Debian", "Ubuntu", "Alpine"]},
                 "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},
         "archive": {"type": "object", "propertyNames": {"pattern": "^[a-z]+(-updates|-security)?$"},
                     "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},

@@ -2,9 +2,15 @@
  "note": [
   "Per-release row floors for the row-count gate (builder/osvfeed.py row_gate). A release below",
   "max(this, half its previous count) is not published; its previous file is carried forward. Set 2026-11-05",
-  "to half of the first S2 build's counts. A new release needs an entry here."
+  "to half of the first S2 build's counts. A new release needs an entry here.",
+  "Alpine (S4) set 2026-11-05 to half of the first local S4 build's counts (2286, 2347, 2486, 2650, 2636)."
  ],
  "minimums": {
+  "alpine-3.20": 1143,
+  "alpine-3.21": 1173,
+  "alpine-3.22": 1243,
+  "alpine-3.23": 1325,
+  "alpine-3.24": 1318,
   "debian-11": 568,
   "debian-12": 596,
   "debian-13": 347,

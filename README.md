@@ -3,9 +3,9 @@
 The signed host vulnerability feed meshTerm reads for "Security updates" (meshTerm
 `docs/plan-host-cve-scanner.md`). Plain static JSON on GitHub Pages, rebuilt twice a day.
 
-**Stage S2 (this state): curated rules plus OSV release files for dpkg releases.** The manifest carries the
-hand-written Tailscale rules and one release file per Ubuntu / Debian release (`builder/osvfeed.py`). Alpine
-(S4) and the rpm family (S5) come later.
+**Stages S2 + S4 (this state): curated rules plus OSV release files for dpkg and apk releases.** The manifest
+carries the hand-written Tailscale rules and one release file per Ubuntu / Debian / Alpine release
+(`builder/osvfeed.py`). The rpm family (S5) comes later.
 
 ## Layout
 
@@ -23,7 +23,10 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   refused, so a compromised feed key can only add or hide a finding.
 - `builder/build.py`: writes `out/v1/manifest.json` and the content-addressed files, then gates them.
 - `builder/osvfeed.py`: the OSV release files (rules and gates below); `builder/netfetch.py` its downloads and
-  cache; `builder/dpkgver.py` Debian version comparison; `builder/cvss.py` CVSS 3.x and 4.0 scores.
+  cache; `builder/dpkgver.py` Debian version comparison; `builder/apkver.py` Alpine version comparison (a twin
+  of apk-tools v3.0.8 `src/version.c`, tested against apk-tools' own `test/unit/version.data`, kept
+  byte-identical with meshTerm's copy in `tests/fixtures/apk-version.data`); `builder/cvss.py` CVSS 3.x and 4.0
+  scores.
 - `builder/baselines/debian-<n>.tsv`: release-day source versions, from snapshot.debian.org (`build.py baseline`).
 - `builder/golden/`: the golden fixtures and their expectations (`expected.json`).
 - `gates/`: the committed row-count minimums and reviewed overrides.
@@ -71,7 +74,46 @@ package: hosts match `${source:Package}` / `${source:Version}`.
 
 Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ubuntu-20.04`, `-22.04`, `-24.04`,
 `-26.04`, `-26.10` (the current interim; 25.10 is end of life), `ubuntu-<lts>-esm` (the `Ubuntu:Pro:<lts>` rows,
-for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`.
+for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`, `alpine-3.20` .. `alpine-3.24` (`Alpine:v3.20` ..
+`Alpine:v3.24`). **alpine-3.20 (EOL 2026-04-01) and alpine-3.21 (EOL 2026-11-01) are past end of life**
+(alpinelinux.org/releases.json); they are kept for now, as their hosts still exist, and dropping them is an open
+decision.
+
+### Alpine (S4, `format: "apk"`)
+
+```json
+{"release":"alpine-3.22","format":"apk","keyedBy":"origin",
+ "pkgs":{"openssl":[["0","3.3.2-r0",3,["CVE-2024-0001"]],["3.3.0","3.3.2-r1",4,["CVE-2024-0002"]]]},
+ "kernel":{"linux-lts":[["0","6.6.58-r0",4,12,null]]}}
+```
+
+Keyed by ORIGIN (`o:` in `/lib/apk/db/installed`; origin names may contain `_`). `introduced` is `"0"` or an apk
+version: OSV Alpine gives the UPSTREAM version (`2.9.2`, below every `2.9.2-rN`), kept as is (18% of rows have one).
+Differences from the dpkg rules:
+
+- **Range rule**: a range's events are sorted by apk version (`"0"` lowest) and walked as OSV does; each
+  (introduced, the FIRST fixed after it) is one row. A later fixed of a closed range (`[0, f1, f2, f3]`) is
+  `redundant fixed`, and a fixed below its introduced (prosody `[13.0.0, 0.12.6-r0)`) an `empty range`: both
+  dropped and counted, not failures. Other event kinds or range types fail the release, as for dpkg.
+- **Rejects**: a date-shaped value, or one apk-tools' validator refuses, is rejected (fixed: `opensmtpd
+  6.6.2p1-r0`; introduced: `libdwarf 1999-12-14`, ImageMagick's own `7.0.0-0` / `6.9.10-54` scheme). Fixed and
+  date rejects count toward the 0.5% gate. Unparseable `introduced` values have their own 2% gate
+  (`INTRODUCED_REJECT_LIMIT`): ImageMagick alone is about 0.58% of Alpine rows, over the shared limit. Those
+  ImageMagick rows are dropped (a known false negative, not a false positive).
+- **No baseline cut and no published check.** Alpine fixes come from secdb, which is built from each branch's
+  aports `secfixes`, so a fix listed for a branch is in that branch's repository. There is no archive check yet:
+  APKINDEX.tar.gz is RSA-signed with Alpine's keys, which the Python stdlib cannot verify. No release-day archive
+  exists to cut against, and a fix older than the release never matches a host of it anyway.
+- **Severity**: the highest CVSS 3.x/4.0 score, else Medium (not shipped).
+- **Kernel**: `linux-lts`, `linux-edge`, `linux-rpi`, `linux-virt`, `linux-stable` fold to kernel rows (not
+  `linux-pam`, `linux-headers`, `linux-firmware*`, `linux-tools`), with a **null** publishedDate: OSV Alpine
+  has no fix date (a record's `published` is the CVE's NVD date, older than the fix), and the app never counts
+  a pending kernel restart from a null date.
+- **Golden cases** (`builder/golden/*.apk.txt`): the app's Pro probe output (`grep -E "^([PVo]:|$)"
+  /lib/apk/db/installed`, as uid 1000) from stock `alpine:3.20`, `alpine:3.20.0` and `alpine:latest`. They are
+  matched against the shipped rows exactly as the app does (per origin the highest installed version;
+  `introduced <= installed < fixed`). With no fix dates and no archive snapshot, a frozen image gains hits as
+  fixes land, so they are `atLeast` cases.
 
 **Adding a release** (every Ubuntu interim, every six months; the next is 27.04), in one pull request:
 
@@ -259,6 +301,6 @@ UTC.
 
 ## TODO
 
-- S4 (Alpine) and S5 (rpm) release files; the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
+- S5 (rpm) release files; an APKINDEX published check for Alpine (needs RSA verification); the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
   allowlist when it ships.
 - An emergency publish path in the workflow (a committed `manifest.json.minisig` mode, as in meshterm-recipes).

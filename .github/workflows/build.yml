@@ -286,7 +286,8 @@ jobs:
           # release; builder/osvfeed.py check_release_body() did the full schema check in the build job.
           allow = {"ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                    "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
-                   "debian-11", "debian-12", "debian-13"}
+                   "debian-11", "debian-12", "debian-13",
+                   "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24"}
           # Releases dropped from the feed (builder/osvfeed.py RETIRED_RELEASES): never a manifest entry, their
           # old files allowed only as carry-overs (checked against builds/ below) until they age out.
           retired = set()
@@ -302,7 +303,7 @@ jobs:
               if not isinstance(e, dict) or set(e) != {"format", "file", "sha256", "bytes", "rows"}:
                   problems.append(f"release {key}: bad entry keys"); continue
               sha, name = e["sha256"], e["file"]
-              if e["format"] != "dpkg" or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
+              if e["format"] != ("apk" if key.startswith("alpine-") else "dpkg") or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
                       or name != f"r/{key}-{sha[:16]}.json" \
                       or type(e["bytes"]) is not int or not 0 < e["bytes"] <= 600 * 1024 \
                       or type(e["rows"]) is not int or e["rows"] < 0:
@@ -334,10 +335,12 @@ jobs:
               problems.append("sources keys are not exactly osv, archive, baseline")
           else:
               osv, arc, base = src["osv"], src["archive"], src["baseline"]
-              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu"} \
+              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu", "Alpine"} \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in osv.values()):
-                  problems.append("sources.osv is not {Debian|Ubuntu: UTC time}")
-              if not isinstance(arc, dict) or not arc or len(arc) > 64 \
+                  problems.append("sources.osv is not {Debian|Ubuntu|Alpine: UTC time}")
+              # Alpine releases have no archive: it may be empty only when every release is an Alpine one.
+              dpkg = any(not k.startswith("alpine-") for k in rels)
+              if not isinstance(arc, dict) or (dpkg and not arc) or len(arc) > 64 \
                       or not all(isinstance(k, str) and re.fullmatch(r"[a-z]+(-updates|-security)?", k) for k in arc) \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in arc.values()):
                   problems.append("sources.archive is not {suite: UTC time}")
