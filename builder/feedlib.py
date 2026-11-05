@@ -64,7 +64,7 @@ def dumps(obj):
 
 
 def parse_version(text):
-    match = VERSION_RE.match(text) if isinstance(text, str) else None
+    match = VERSION_RE.fullmatch(text) if isinstance(text, str) else None
     if not match:
         raise FeedError(f"version {text!r} is not plain N.N.N")
     return tuple(int(part) for part in match.groups())

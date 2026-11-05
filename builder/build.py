@@ -44,17 +44,19 @@ MAX_LIVE_LEAD = 100
 
 
 class Log:
-    def __init__(self):
-        self.lines, self.warnings = [], []
+    def __init__(self, echo=True):
+        self.lines, self.warnings, self.echo = [], [], echo
 
     def info(self, text):
         self.lines.append(text)
-        print(text)
+        if self.echo:
+            print(text)
 
     def warn(self, text):
         self.warnings.append(text)
         self.lines.append(f"WARNING: {text}")
-        print(f"::warning::{text}")
+        if self.echo:
+            print(f"::warning::{text}")
 
 
 # --- S2 seam -------------------------------------------------------------------------------------------
@@ -143,7 +145,7 @@ def carry_previous(past, site_v1, carry_base, log):
     carried = []
     for serial, record in past[:KEEP_BUILDS - 1]:
         for rel, sha in sorted(referenced_files(record.get("manifest") or {}).items()):
-            if not FILE_RE.match(rel) or not isinstance(sha, str) or not SHA_RE.match(sha):
+            if not FILE_RE.fullmatch(rel) or not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
                 log.warn(f"builds/{serial}.json names a bad file {rel!r}; not carried")
                 continue
             dest = os.path.join(site_v1, rel)
@@ -182,7 +184,7 @@ def check_manifest(manifest):
     if manifest["version"] != manifest["serial"] or not is_int(manifest["version"]):
         raise FeedError("version must equal serial (the app's verifier reads `version`)")
     generated = manifest["generated"]
-    if not isinstance(generated, str) or not GENERATED_RE.match(generated):
+    if not isinstance(generated, str) or not GENERATED_RE.fullmatch(generated):
         raise FeedError("generated must be UTC ISO 8601 like 2026-11-05T05:10:00Z")
     datetime.datetime.strptime(generated, "%Y-%m-%dT%H:%M:%SZ")
     if not isinstance(manifest["sources"], dict):
@@ -197,10 +199,10 @@ def check_manifest(manifest):
             raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)}")
         if entry["format"] not in RELEASE_FORMATS:
             raise FeedError(f"release {key}: format must be one of {RELEASE_FORMATS}")
-        if not isinstance(entry["file"], str) or not FILE_RE.match(entry["file"]) \
+        if not isinstance(entry["file"], str) or not FILE_RE.fullmatch(entry["file"]) \
                 or not entry["file"].startswith(f"r/{key}-"):
             raise FeedError(f"release {key}: bad file name {entry['file']!r}")
-        if not isinstance(entry["sha256"], str) or not SHA_RE.match(entry["sha256"]):
+        if not isinstance(entry["sha256"], str) or not SHA_RE.fullmatch(entry["sha256"]):
             raise FeedError(f"release {key}: bad sha256")
         for count in ("bytes", "rows"):
             if not is_int(entry[count]) or entry[count] < 0:
@@ -210,7 +212,7 @@ def check_manifest(manifest):
         raise FeedError("curated must be {file, sha256}")
     if not isinstance(curated["file"], str) or not re.fullmatch(r"curated-[0-9a-f]{16}\.json", curated["file"]):
         raise FeedError(f"bad curated file name {curated['file']!r}")
-    if not isinstance(curated["sha256"], str) or not SHA_RE.match(curated["sha256"]) \
+    if not isinstance(curated["sha256"], str) or not SHA_RE.fullmatch(curated["sha256"]) \
             or not curated["file"].startswith(f"curated-{curated['sha256'][:16]}"):
         raise FeedError("curated sha256 is malformed or does not match its file name")
 
@@ -253,7 +255,7 @@ def gate(out_dir, log):
             total += size
             if size > FILE_CAP:
                 raise FeedError(f"{os.path.relpath(full, out_dir)} is {size} bytes, at most {FILE_CAP}")
-            if root.startswith(site_v1) and rel not in ("manifest.json", "manifest.json.minisig") and not FILE_RE.match(rel):
+            if root.startswith(site_v1) and rel not in ("manifest.json", "manifest.json.minisig") and not FILE_RE.fullmatch(rel):
                 raise FeedError(f"unexpected file v1/{rel}")
     log.info(f"gate: pass (serial {manifest['serial']}, {len(raw)} byte manifest, {total} bytes in the site)")
     return manifest
@@ -261,10 +263,10 @@ def gate(out_dir, log):
 
 # --- build ---------------------------------------------------------------------------------------------
 def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, log=None):
-    log = log or Log()
-    if not COMMIT_RE.match(commit):
+    log = log or Log(echo=False)
+    if not COMMIT_RE.fullmatch(commit):
         raise FeedError("--commit must be a 40-hex commit id")
-    if not GENERATED_RE.match(now):
+    if not GENERATED_RE.fullmatch(now):
         raise FeedError("--now must be UTC ISO 8601 like 2026-11-05T05:10:00Z")
     past = history(os.path.join(repo_root, "builds"))
     serial = next_serial(past, live_manifest, log)

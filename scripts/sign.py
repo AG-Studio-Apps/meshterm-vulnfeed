@@ -64,7 +64,7 @@ def trusted_comment(serial, date, commit=None):
     comment = f"vulnfeed=host-vulns version={serial} date={date}"
     if commit:
         comment += f" commit={commit}"
-    if not COMMENT_RE.match(comment):
+    if not COMMENT_RE.fullmatch(comment):
         raise FeedError(f"would sign a malformed trusted comment {comment!r}")
     return comment
 
@@ -91,7 +91,7 @@ def check_pair(body, signature, role="any", keys_dir=KEYS_DIR, require_commit=Fa
         if result.returncode != 0:
             raise FeedError(f"minisign: the signature does not verify against vulnfeed-{signer}.pub "
                             f"({(result.stderr or result.stdout).strip()[:200]})")
-    match = COMMENT_RE.match(comment)
+    match = COMMENT_RE.fullmatch(comment)
     if not match:
         raise FeedError(f"trusted comment {comment!r} is not "
                         "'vulnfeed=host-vulns version=<serial> date=<YYYY-MM-DD>[ commit=<sha>]'")

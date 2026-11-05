@@ -71,7 +71,7 @@ def validate(doc):
 
         rid = rule.get("id")
         if "id" in rule:
-            if not isinstance(rid, str) or not ID_RE.match(rid):
+            if not isinstance(rid, str) or not ID_RE.fullmatch(rid):
                 errors.append(f"{where}: id must match {ID_RE.pattern}")
             elif rid in seen:
                 errors.append(f"{where}: duplicate id")
@@ -96,15 +96,15 @@ def validate(doc):
             errors.append(f"{where}: kind must be one of {', '.join(KINDS)}")
         if "appliesTo" in rule and rule["appliesTo"] not in APPLIES_TO:
             errors.append(f"{where}: appliesTo must be one of {', '.join(APPLIES_TO)}")
-        if "title" in rule and (not isinstance(rule["title"], str) or not TITLE_RE.match(rule["title"])):
+        if "title" in rule and (not isinstance(rule["title"], str) or not TITLE_RE.fullmatch(rule["title"])):
             errors.append(f"{where}: title must be 3-120 characters of plain prose ({TITLE_RE.pattern})")
         if "url" in rule and (not isinstance(rule["url"], str) or len(rule["url"]) > 200
-                              or not URL_RE.match(rule["url"])):
+                              or not URL_RE.fullmatch(rule["url"])):
             errors.append(f"{where}: url must be a plain https URL ({URL_RE.pattern})")
         if "ids" in rule:
             ids = rule["ids"]
             if not isinstance(ids, list) or len(ids) > 32 \
-                    or not all(isinstance(i, str) and ADVISORY_RE.match(i) for i in ids):
+                    or not all(isinstance(i, str) and ADVISORY_RE.fullmatch(i) for i in ids):
                 errors.append(f"{where}: ids must be up to 32 advisory ids like CVE-2026-1234 or TS-2026-014")
             elif len(set(ids)) != len(ids):
                 errors.append(f"{where}: ids has duplicates")
