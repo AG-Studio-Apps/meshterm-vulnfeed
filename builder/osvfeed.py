@@ -32,13 +32,17 @@ Then, per release, with the archive Sources of every pocket and component loaded
 8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`.
 
 Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
-1. Each range's events are sorted by apk version ("0" lowest) and walked as OSV does: introduced opens,
-   fixed closes; each (introduced, the FIRST fixed after it) is one row. A fixed with no open introduced
-   (the 2nd/3rd fixed of [0, f1, f2, f3], or a fixed below its introduced) is dropped and counted, not a
-   failure. If any value of the range is not a valid apk version the events are walked in the order given,
-   and resolve() rejects the pairs holding the bad value.
-4. A fixed or introduced value that is date-shaped or not a valid apk version (builder/apkver.py) is
-   rejected (the same REJECT_LIMIT gate).
+1. A range with a not-affected marker (fixed "0" / "0-r0") is dropped whole and counted. Each `introduced` is
+   normalised (1a): an upstream X.Y.Z-N (ImageMagick 7.0.0-0) becomes the dotted X.Y.Z.N aports writes, any
+   other unparseable value (a date) becomes "0"; both are counted, and the "0" kind is gated
+   (INTRODUCED_REJECT_LIMIT). A fixed value apk cannot order is taken out of the walk and kept as a pair of its
+   own for resolve() to reject. The remaining events are sorted by apk version ("0" lowest) and walked as OSV
+   does: introduced opens, fixed closes; each (introduced, the FIRST fixed after it) is one row (OSV parity:
+   postgresql17 CVE-2026-2006 [0, 17.8-r0, 17.9-r0] is affected below 17.8-r0 only). A fixed with no open
+   introduced (the 2nd/3rd fixed of [0, f1, f2, f3], or a fixed below its introduced) is dropped and counted,
+   not a failure.
+4. A fixed value that is date-shaped or not a valid apk version (builder/apkver.py) is rejected (the same
+   REJECT_LIMIT gate).
 5, 6. No baseline cut, no leading-token check and no published check: Alpine fixes come from secdb, built
    from the branch's aports secfixes (so a fix is in that branch's repository), and there is no
    release-day archive to cut against. APKINDEX is RSA-signed, which the stdlib cannot verify.
@@ -83,9 +87,10 @@ DEBIAN_SECURITY = "https://security.debian.org/debian-security"
 SNAPSHOT = "https://snapshot.debian.org/archive/debian"
 
 REJECT_LIMIT = 0.005        # rejected fixed versions, per OSV ecosystem, as a share of fixed rows
-# Alpine rows whose `introduced` (an UPSTREAM version in OSV Alpine) apk cannot parse, gated on their own:
-# ImageMagick's upstream `7.0.0-0` / `6.9.10-54` scheme is 95% of them (measured 2026-11-05: 104 of 17,856
-# rows, 0.58%, which alone is over REJECT_LIMIT). They are still rejected (dropped and counted).
+# Alpine `introduced` values that are neither an apk version nor an upstream X.Y.Z-N (dates: libdwarf
+# 1999-12-14, jq 2026-04-02) are read as "0" (normalise_apk_introduced), which WIDENS their range; that kind is
+# gated on its own, as a share of the zip's fixed range events. The X.Y.Z-N kind (ImageMagick 7.0.0-0, 104 of
+# 17,856 rows on 2026-11-05) is normalised to the dotted form aports uses and is only counted.
 INTRODUCED_REJECT_LIMIT = 0.02
 ROW_SWING = 0.30            # per-release row count change allowed against the previous build
 ROW_SWING_FLOOR = 25        # ... or this many rows, whichever is larger (small files swing by single rows)
@@ -247,6 +252,39 @@ def _apk_event_key(event):
     return (0, 0) if kind == "introduced" and value == "0" else (1, apkver.sort_key(value))
 
 
+# Not-affected markers: a range whose fixed is "0" / "0-r0" says the package never had the bug (secdb lists a
+# CVE with fix "0" for a branch that was never affected). Such a range is dropped whole and counted.
+NOT_AFFECTED_FIXED = ("0", "0-r0")
+# OSV Alpine `introduced` values apk cannot parse (rule 1a of the Alpine notes): an upstream `X.Y.Z-N` (ImageMagick
+# 7.0.0-0, 6.9.10-54; go 1.21.0-0) is the same version aports writes dotted (imagemagick 7.1.2.15-r0), so it is
+# normalised to that; anything else (libdwarf 1999-12-14, jq 2026-04-02: dates, not versions) becomes "0".
+_UPSTREAM_DASHED = re.compile(r"^\d+(\.\d+)*-\d+$")
+INTRO_NORMALISED = "introduced normalised (X.Y.Z-N -> X.Y.Z.N)"
+INTRO_ZEROED = "introduced unparseable -> 0"
+NOT_AFFECTED = "not-affected range (fixed 0) dropped"
+BAD_FIXED = "bad fixed event kept apart (range walked without it)"
+
+
+def _apk_ok(value):
+    return apkver.validate(value) and not _DATE_SHAPED.match(value)
+
+
+def normalise_apk_introduced(value, counters=None):
+    """An Alpine `introduced` as apk can compare it (rule 1a): "0" and valid apk versions unchanged, an upstream
+    `X.Y.Z-N` dotted, anything else "0". `counters` counts the two kinds of change."""
+    if value == "0" or _apk_ok(value):
+        return value
+    if not _DATE_SHAPED.match(value) and _UPSTREAM_DASHED.match(value):
+        dotted = value.replace("-", ".")
+        if _apk_ok(dotted):
+            if counters is not None:
+                counters[INTRO_NORMALISED] += 1
+            return dotted
+    if counters is not None:
+        counters[INTRO_ZEROED] += 1
+    return "0"
+
+
 def apk_range_pairs(affected, counters):
     """[(introduced, fixed)] for one Alpine affected[] entry (rule 1 of the Alpine notes above). Dropped fixed
     events are counted in `counters`: `redundant fixed` (a later fixed of an already closed range) and `empty
@@ -260,22 +298,39 @@ def apk_range_pairs(affected, counters):
         events = _event_list(rng)
         counters["shape [" + ", ".join("introduced 0" if (k, v) == ("introduced", "0") else
                                        "introduced X" if k == "introduced" else k for k, v in events) + "]"] += 1
-        if all((k == "introduced" and v == "0") or (apkver.validate(v) and not _DATE_SHAPED.match(v))
-               for k, v in events):
-            events = sorted(events, key=_apk_event_key)
-        else:
-            counters["ranges walked unsorted (a bad version)"] += 1
+        if any(k == "fixed" and v in NOT_AFFECTED_FIXED for k, v in events):
+            counters[NOT_AFFECTED] += 1
+            continue
+        events = [(k, normalise_apk_introduced(v, counters) if k == "introduced" else v) for k, v in events]
+        # A fixed value apk cannot order (opensmtpd 6.6.2p1-r0) is kept out of the walk, so one bad event never
+        # unsorts the range or costs it a good fix; it becomes a pair of its own (with the introduced it followed
+        # in the given order) for resolve_apk() to reject and count toward REJECT_LIMIT.
+        bad, last_intro = [], "0"
+        for kind, value in events:
+            if kind == "introduced":
+                last_intro = value
+            elif not _apk_ok(value):
+                bad.append((last_intro, value))
+        if bad:
+            counters[BAD_FIXED] += len(bad)
+            events = [(k, v) for k, v in events if k == "introduced" or _apk_ok(v)]
+        events = sorted(events, key=_apk_event_key)
         introduced, closed_any = None, False
         for kind, value in events:
             if kind == "introduced":
                 if introduced is not None:
-                    raise ShapeError("introduced twice without a fixed between")
+                    if not bad:
+                        raise ShapeError("introduced twice without a fixed between")
+                    # The fixed between them was a bad value kept apart: the range stays open from the lower.
+                    counters["introduced while open (its fixed was bad)"] += 1
+                    continue
                 introduced = value
             elif introduced is None:
                 counters["redundant fixed" if closed_any else "empty range (fixed below introduced)"] += 1
             else:
                 pairs.append((introduced, value))
                 introduced, closed_any = None, True
+        pairs.extend(bad)
     return pairs
 
 
@@ -401,8 +456,8 @@ def ingest(zip_path, releases, log):
                 stats[f"{release.key}: affected entries"] += 1
                 source = package.get("name")
                 try:
+                    dropped = collections.Counter()
                     if release.format == "apk":
-                        dropped = collections.Counter()
                         pairs = apk_range_pairs(affected, dropped)
                         for reason, count in dropped.items():
                             stats[f"{release.key}: {reason}"] += count
@@ -416,7 +471,8 @@ def ingest(zip_path, releases, log):
                         shapes.append(f"{rid} {release.ecosystem} {source}: {error}")
                     continue
                 if not pairs:
-                    stats[f"{release.key}: unfixed (dropped)"] += 1
+                    if not (release.format == "apk" and dropped[NOT_AFFECTED]):
+                        stats[f"{release.key}: unfixed (dropped)"] += 1
                     continue
                 if release.family == "ubuntu":
                     availability = (affected.get("ecosystem_specific") or {}).get("availability")
@@ -1116,7 +1172,9 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
         if unarchived:
             failures.append(f"golden {case['fixture']}: hits on sources not in {case['archive']}: "
                             + ", ".join(unarchived[:5]))
-        extra = sorted(got - expected) if "exact" in case else []
+        # apk `atLeast` cases are limited too (M1): with no fix dates a frozen image gains real hits, but 3 or more
+        # unexpected origins at once is a matcher or data problem, not drift.
+        extra = sorted(got - expected) if ("exact" in case or fmt == "apk") else []
         if extra:
             weak = sorted({f"{row['source']} ({rule})" for row in rows if row["source"] in extra
                            and row["fixed"] in hits[row["source"]]
@@ -1128,8 +1186,10 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
                 failures.append(f"golden {case['fixture']}: unexpected hit(s) rated High by a heuristic rule, "
                                 f"not a score: {', '.join(weak)}")
             else:
-                log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
-                         "fix that was in the archive at capture; update expected.json if it is right)")
+                why = ("a new secdb fix for a frozen image" if fmt == "apk" else
+                       "OSV re-rated or added a fix that was in the archive at capture")
+                log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; {why}; update "
+                         "expected.json if it is right)")
         if not failures:
             when = "every shipped row, no fix dates" if fmt == "apk" else f"before {case['capture']}"
             log.info(f"golden {case['fixture']} ({key}, {when}): {len(got)} source(s) flagged: {detail}")
@@ -1318,28 +1378,30 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 log.info(f"osv {zip_name}: {key} {value}")
         if shapes:
             log.info(f"osv {zip_name}: unknown shapes, e.g. " + "; ".join(shapes[:5]))
-        zip_fixed = zip_rejected = zip_intro = 0
+        zip_fixed = zip_rejected = zip_intro = zip_events = 0
         pending = {}
         for release in members:
             try:
                 pending[release.key] = _one_release(release, candidates[release.key], info, stats, archives,
                                                     baselines, work, log)
                 zip_fixed += len(candidates[release.key])
-                zip_rejected += pending[release.key]["rejected"] - pending[release.key]["rejected_intro"]
-                zip_intro += pending[release.key]["rejected_intro"]
+                zip_rejected += pending[release.key]["rejected"]
+                zip_intro += pending[release.key]["intro_zeroed"]
+                zip_events += pending[release.key]["fixed_events"]
             except _SOFT as error:
                 fail([release.key], soft_reason("build", error))
         share = zip_rejected / zip_fixed if zip_fixed else 0.0
-        intro_share = zip_intro / zip_fixed if zip_fixed else 0.0
+        intro_share = zip_intro / zip_events if zip_events else 0.0
         log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})"
-                 + (f", and {zip_intro} for an unparseable introduced ({intro_share:.3%})" if zip_intro else ""))
+                 + (f"; {zip_intro} of {zip_events} fixed range events had an unparseable introduced read as "
+                    f"\"0\" ({intro_share:.3%})" if zip_intro else ""))
         if share >= REJECT_LIMIT:
             fail(list(pending), f"osv {zip_name}: {share:.2%} of fixed versions rejected, the limit is "
                                 f"{REJECT_LIMIT:.1%}")
             continue
         if intro_share >= INTRODUCED_REJECT_LIMIT:
-            fail(list(pending), f"osv {zip_name}: {intro_share:.2%} of rows rejected for an unparseable "
-                                f"introduced, the limit is {INTRODUCED_REJECT_LIMIT:.1%}")
+            fail(list(pending), f"osv {zip_name}: {intro_share:.2%} of range events had an unparseable "
+                                f"introduced (read as \"0\"), the limit is {INTRODUCED_REJECT_LIMIT:.1%}")
             continue
         for key, built in sorted(pending.items()):
             problems = []
@@ -1389,6 +1451,14 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         log.info(f"{release.key}: rejected {counters['rejected']} ("
                  + ", ".join(f"{k[10:]} {v}" for k, v in sorted(counters.items()) if k.startswith("rejected: "))
                  + "), e.g. " + "; ".join(examples[:4]))
+    if release.format == "apk":
+        # Per release (the INTRODUCED_REJECT_LIMIT gate is zip-wide, as REJECT_LIMIT is): one release's share.
+        events = stats[f"{release.key}: fixed rows"]
+        zeroed = stats[f"{release.key}: {INTRO_ZEROED}"]
+        log.info(f"{release.key}: introduced: {stats[f'{release.key}: {INTRO_NORMALISED}']} normalised to the "
+                 f"dotted form, {zeroed} unparseable read as \"0\" ({zeroed / events if events else 0:.3%} of its "
+                 f"{events} fixed range events); {stats[f'{release.key}: {NOT_AFFECTED}']} not-affected range(s) "
+                 f"dropped; {stats[f'{release.key}: {BAD_FIXED}']} bad fixed event(s) kept apart")
     kernels = sorted({r["source"] for r in rows if r["kernel"]})
     if kernels:
         log.info(f"{release.key}: kernel sources folded ({len(kernels)}): {' '.join(kernels)}")
@@ -1396,5 +1466,6 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         json.dump({"release": release.key, "counters": counters, "decisions": decisions,
                    "osv": summary, "rows": rows, "dropped": dropped}, handle, indent=0, sort_keys=True)
     return {"rows": rows, "data": data, "count": row_count(body), "rejected": counters["rejected"],
-            "format": release.format, "rejected_intro": counters["rejected: introduced not an apk version"],
+            "format": release.format, "intro_zeroed": stats[f"{release.key}: {INTRO_ZEROED}"],
+            "fixed_events": stats[f"{release.key}: fixed rows"],
             "unknown": stats[f"{release.key}: unknown range shape"]}

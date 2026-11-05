@@ -12,8 +12,10 @@
   "Alpine (apk) cases: the fixture is the app's Pro probe output (P:/V:/o: lines of /lib/apk/db/installed) from a stock",
   "image, matched against the SHIPPED rows exactly as the app does (introduced <= installed < fixed, per origin the",
   "highest version, kernel origins not counted). OSV Alpine has no fix dates and there is no archive snapshot, so a",
-  "frozen image legitimately gains hits as fixes land: these cases are `atLeast` (a superset is fine), measured",
-  "2026-11-05 against the local S4 build. alpine:3.20 (3.20.10, sha256:d9e853e87e55...) flags nothing; alpine:3.20.0",
+  "frozen image legitimately gains hits as fixes land: these cases are `atLeast`, measured 2026-11-05 against the",
+  "local S4 build, and 3 or more unexpected origins still fail (EXTRA_HIT_LIMIT, as for exact cases). alpine:3.20",
+  "(3.20.10, sha256:d9e853e87e55...) flags nothing and is `exact: []`: 3.20 is end of life, so it is the Alpine",
+  "false-positive gate (an unexpected origin warns, 3 or more fail). alpine:3.20.0",
   "(sha256:77726ef6b57d..., May 2024) flags musl, openssl, zlib; alpine:latest (3.24.2, sha256:294b683cb724...) flags",
   "zlib (1.3.2-r0 < 1.3.2-r1, CVE-2026-85091)."
  ],
@@ -62,7 +64,7 @@
    "fixture": "alpine-3.20-stock.apk.txt",
    "release": "alpine-3.20",
    "capture": "2026-11-05",
-   "atLeast": []
+   "exact": []
   },
   {
    "fixture": "alpine-3.20.0-20240522.apk.txt",

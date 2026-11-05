@@ -321,6 +321,8 @@ jobs:
               if not isinstance(body, dict) or body.get("release") != key \
                       or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
                   problems.append(f"release {key}: {name} does not name its release"); continue
+              if body.get("format") != e["format"]:
+                  problems.append(f"release {key}: {name} says format {body.get('format')!r}, the manifest {e['format']!r}"); continue
               try:
                   count = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
               except (AttributeError, TypeError):

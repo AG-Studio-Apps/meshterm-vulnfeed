@@ -55,10 +55,46 @@ class RangeRule(unittest.TestCase):
         pairs, _ = self.pairs(("introduced", "0"), ("fixed", "1.0-r0"), ("introduced", "2.0"), ("fixed", "2.1-r0"))
         self.assertEqual(pairs, [("0", "1.0-r0"), ("2.0", "2.1-r0")])
 
-    def test_bad_versions_walk_unsorted(self):
-        pairs, counters = self.pairs(("introduced", "7.0.0-0"), ("fixed", "7.1.0.10-r0"))
-        self.assertEqual(pairs, [("7.0.0-0", "7.1.0.10-r0")])      # resolve() rejects it
-        self.assertEqual(counters["ranges walked unsorted (a bad version)"], 1)
+    def test_introduced_normalised(self):
+        # H1: ImageMagick's upstream X.Y.Z-N is aports' dotted X.Y.Z.N; any other unparseable value is "0".
+        pairs, counters = self.pairs(("introduced", "7.0.0-0"), ("fixed", "7.1.2.15-r0"))
+        self.assertEqual(pairs, [("7.0.0.0", "7.1.2.15-r0")])
+        self.assertEqual(counters[osvfeed.INTRO_NORMALISED], 1)
+        pairs, _ = self.pairs(("introduced", "6.9.10-54"), ("fixed", "7.0.8.56-r0"))
+        self.assertEqual(pairs, [("6.9.10.54", "7.0.8.56-r0")])
+        pairs, _ = self.pairs(("introduced", "1.21.0-0"), ("fixed", "1.21.5-r0"))       # go
+        self.assertEqual(pairs, [("1.21.0.0", "1.21.5-r0")])
+        for date in ("1999-12-14", "2026-04-02", "abc def"):                              # libdwarf, jq
+            pairs, counters = self.pairs(("introduced", date), ("fixed", "0.6.0-r0"))
+            self.assertEqual(pairs, [("0", "0.6.0-r0")], date)
+            self.assertEqual(counters[osvfeed.INTRO_ZEROED], 1, date)
+            self.assertEqual(counters[osvfeed.INTRO_NORMALISED], 0, date)
+        # A valid apk introduced is never touched.
+        self.assertEqual(osvfeed.normalise_apk_introduced("2.9.2"), "2.9.2")
+        self.assertEqual(osvfeed.normalise_apk_introduced("0"), "0")
+        # The normalised value orders as aports' versions do: 7.0.0.0 <= 7.1.2.8-r0 < 7.1.2.15-r0.
+        self.assertLess(osvfeed.apkver.compare("7.0.0.0", "7.1.2.8-r0"), 0)
+
+    def test_not_affected_ranges_dropped(self):
+        # L1: secdb's fix "0" / "0-r0" means never affected (db CVE-2016-0682): no row, counted.
+        for marker in ("0", "0-r0"):
+            pairs, counters = self.pairs(("introduced", "0"), ("fixed", marker))
+            self.assertEqual(pairs, [], marker)
+            self.assertEqual(counters[osvfeed.NOT_AFFECTED], 1, marker)
+
+    def test_one_bad_fixed_does_not_unsort_the_range(self):
+        # L2: the valid events are still sorted (the higher fixed listed first), the good first fix kept; the bad
+        # value is a pair of its own for resolve_apk to reject and count.
+        pairs, counters = self.pairs(("introduced", "0"), ("fixed", "6.6.4p1-r1"), ("fixed", "6.6.5-r0"),
+                                     ("fixed", "6.6.4-r0"))
+        self.assertEqual(pairs, [("0", "6.6.4-r0"), ("0", "6.6.4p1-r1")])
+        self.assertEqual(counters["redundant fixed"], 1)
+        self.assertEqual(counters[osvfeed.BAD_FIXED], 1)
+        # A bad fixed between two ranges: the range stays open from the lower introduced, never a shape error.
+        pairs, counters = self.pairs(("introduced", "0"), ("fixed", "1.0p1-r0"), ("introduced", "2.0"),
+                                     ("fixed", "2.1-r0"))
+        self.assertEqual(pairs, [("0", "2.1-r0"), ("0", "1.0p1-r0")])
+        self.assertEqual(counters["introduced while open (its fixed was bad)"], 1)
 
     def test_unknown_shapes_raise(self):
         for bad in (entry(("introduced", "0"), ("last_affected", "1.0-r0")),
@@ -120,13 +156,13 @@ class IngestAndResolve(unittest.TestCase):
 
     def test_bad_versions_rejected(self):
         high = [{"type": "CVSS_V3", "score": CVSS_HIGH}]
-        rows, counters, _, _, _, _ = self.run_release([
-            record("ALPINE-CVE-2019-1", [affected(ECO, "imagemagick", [{"introduced": "7.0.0-0"},
-                                                                      {"fixed": "7.1.0.10-r0"}])],
-                   upstream=["CVE-2019-1"], severity=high),
-            record("ALPINE-CVE-2019-2", [affected(ECO, "libdwarf", [{"introduced": "1999-12-14"},
-                                                                   {"fixed": "0.6.0-r0"}])],
-                   upstream=["CVE-2019-2"], severity=high),
+        rows, counters, _, stats, _, _ = self.run_release([
+            record("ALPINE-CVE-2019-17540", [affected(ECO, "imagemagick", [{"introduced": "7.0.0-0"},
+                                                                          {"fixed": "7.1.2.15-r0"}])],
+                   upstream=["CVE-2019-17540"], severity=high),
+            record("ALPINE-CVE-2019-14249", [affected(ECO, "libdwarf", [{"introduced": "1999-12-14"},
+                                                                       {"fixed": "0.6.0-r0"}])],
+                   upstream=["CVE-2019-14249"], severity=high),
             record("ALPINE-CVE-2020-7247", [affected(ECO, "opensmtpd", [{"introduced": "0"},
                                                                        {"fixed": "6.6.2p1-r0"}])],
                    upstream=["CVE-2020-7247"], severity=high),
@@ -134,12 +170,24 @@ class IngestAndResolve(unittest.TestCase):
                    upstream=["CVE-2024-1009"], severity=high),
             record("ALPINE-CVE-2024-10010", [affected(ECO, "curl", [{"introduced": "0"}, {"fixed": "8.9.1-r0"}])],
                    upstream=["CVE-2024-10010"], severity=high),
+            record("ALPINE-CVE-2016-0682", [affected(ECO, "db", [{"introduced": "0"}, {"fixed": "0"}])],
+                   upstream=["CVE-2016-0682"], severity=high),
         ])
-        self.assertEqual([r["source"] for r in rows], ["curl"])
-        self.assertEqual(counters["rejected"], 4)
-        self.assertEqual(counters["rejected: introduced not an apk version"], 1)
-        self.assertEqual(counters["rejected: date-shaped"], 2)
+        # H1: ImageMagick's [7.0.0-0, 7.1.2.15-r0) ships as [7.0.0.0, 7.1.2.15-r0); libdwarf's date reads as "0".
+        self.assertEqual([(r["source"], r["introduced"], r["fixed"]) for r in rows],
+                         [("curl", "0", "8.9.1-r0"), ("imagemagick", "7.0.0.0", "7.1.2.15-r0"),
+                          ("libdwarf", "0", "0.6.0-r0")])
+        self.assertEqual(counters["rejected"], 2)
+        self.assertEqual(counters["rejected: date-shaped"], 1)
         self.assertEqual(counters["rejected: fixed not an apk version"], 1)
+        self.assertEqual(stats[f"alpine-3.22: {osvfeed.INTRO_NORMALISED}"], 1)
+        self.assertEqual(stats[f"alpine-3.22: {osvfeed.INTRO_ZEROED}"], 1)
+        self.assertEqual(stats[f"alpine-3.22: {osvfeed.NOT_AFFECTED}"], 1)
+        self.assertEqual(stats["alpine-3.22: unfixed (dropped)"], 0)        # not-affected is not "unfixed"
+        body = osvfeed.release_body(ALP, rows)
+        self.assertEqual(body["pkgs"]["imagemagick"], [["7.0.0.0", "7.1.2.15-r0", 3, ["CVE-2019-17540"]]])
+        osvfeed.check_release_body(json.loads(json.dumps(body)), "alpine-3.22",
+                                   {"format": "apk", "file": "x", "rows": 3})
 
     def test_kernel_fold(self):
         rows, counters, _, _, _, _ = self.run_release([
@@ -302,6 +350,28 @@ class Golden(unittest.TestCase):
         self.assertEqual(osvfeed.check_golden("alpine-3.22", [row], log, self.tmp), [])
         self.assertIn("missing ['openssl']", osvfeed.check_golden("alpine-3.22", [], log, self.tmp)[0])
 
+    def test_apk_extra_hit_limit(self):
+        # M1: apk atLeast and exact cases both get the EXTRA_HIT_LIMIT gate; the EOL 3.20 stock image is exact [].
+        inv = "".join(f"P:{n}\nV:1.0-r0\no:{n}\n\n" for n in ("a1", "a2", "a3", "want"))
+        self.write("l.apk.txt", inv)
+
+        def row(name):
+            return {"source": name, "introduced": "0", "fixed": "1.0-r1", "severity": 3, "ids": ["CVE-2024-1001"],
+                    "kernel": False, "date": None, "rules": {"CVE-2024-1001": "cvss"}}
+        for kind, expected in (("atLeast", ["want"]), ("exact", ["want"])):
+            with open(os.path.join(self.tmp, "expected.json"), "w") as handle:
+                json.dump({"cases": [{"fixture": "l.apk.txt", "release": "alpine-3.22", "capture": "2026-11-05",
+                                      kind: expected}]}, handle)
+            log = helpers_log()
+            self.assertEqual(osvfeed.check_golden("alpine-3.22", [row("want"), row("a1")], log, self.tmp), [], kind)
+            self.assertTrue(any("also flags ['a1']" in w for w in log.warnings), kind)
+            failures = osvfeed.check_golden("alpine-3.22", [row(n) for n in ("want", "a1", "a2", "a3")],
+                                            helpers_log(), self.tmp)
+            self.assertEqual(len(failures), 1, kind)
+            self.assertIn("3 unexpected sources flagged ['a1', 'a2', 'a3']", failures[0])
+        stock = next(c for c in osvfeed.golden_cases() if c["fixture"] == "alpine-3.20-stock.apk.txt")
+        self.assertEqual(stock.get("exact"), [])
+
 
 class Config(unittest.TestCase):
     def test_releases(self):
@@ -392,14 +462,32 @@ class EndToEnd(unittest.TestCase):
 
     def test_rejects_over_the_limit_fail_soft(self):
         high = [{"type": "CVSS_V3", "score": CVSS_HIGH}]
+        # A date-shaped introduced is read as "0" (it widens the range): over 2% of the zip's range events fails.
+        self.write_osv([
+            record("ALPINE-CVE-2024-1001", [affected(ECO, "openssl", [{"introduced": "0"}, {"fixed": "3.3.2-r0"}])],
+                   upstream=["CVE-2024-1001"], severity=high),
+            record("ALPINE-CVE-2024-1003", [affected(ECO, "libdwarf", [{"introduced": "1999-12-14"},
+                                                                      {"fixed": "0.6.0-r0"}])],
+                   upstream=["CVE-2024-1003"], severity=high)], "2027-01-01T00:00:00Z")
+        _, (releases, _, failures) = self.run_build(cache="cache3")
+        self.assertIn('had an unparseable introduced (read as "0"), the limit is 2.0%', failures["alpine-3.22"])
+        # The X.Y.Z-N kind is normalised and only counted: no gate.
         self.write_osv([
             record("ALPINE-CVE-2024-1001", [affected(ECO, "openssl", [{"introduced": "0"}, {"fixed": "3.3.2-r0"}])],
                    upstream=["CVE-2024-1001"], severity=high),
             record("ALPINE-CVE-2024-1003", [affected(ECO, "imagemagick", [{"introduced": "7.0.0-0"},
-                                                                      {"fixed": "7.1.0.10-r0"}])],
-                   upstream=["CVE-2024-1003"], severity=high)], "2027-01-01T00:00:00Z")
-        _, (releases, _, failures) = self.run_build(cache="cache3")
-        self.assertIn("unparseable introduced, the limit is 2.0%", failures["alpine-3.22"])
+                                                                         {"fixed": "7.1.0.10-r0"}])],
+                   upstream=["CVE-2024-1003"], severity=high)], "2027-01-01T12:00:00Z")
+        log = helpers_log()
+        site = os.path.join(self.tmp, "site5", "v1")
+        releases, _, failures = osvfeed.build_releases(
+            site, log, os.path.join(self.tmp, "cache5"), os.path.join(self.tmp, "work"), releases=[ALP],
+            golden_dir=self.golden, gates_dir=self.gates, today="2026-11-05")
+        self.assertEqual(failures, {})
+        self.assertEqual(releases["alpine-3.22"]["rows"], 2)
+        # L6: the per-release share is in the build log.
+        self.assertTrue(any(line.startswith("alpine-3.22: introduced: 1 normalised to the dotted form, 0 "
+                                            "unparseable read as") for line in log.lines), log.lines)
         self.write_osv([
             record("ALPINE-CVE-2024-1001", [affected(ECO, "openssl", [{"introduced": "0"}, {"fixed": "3.3.2-r0"}])],
                    upstream=["CVE-2024-1001"], severity=high),
@@ -407,7 +495,6 @@ class EndToEnd(unittest.TestCase):
                    upstream=["CVE-2024-1003"], severity=high)], "2027-01-02T00:00:00Z")
         _, (releases, _, failures) = self.run_build(cache="cache4")
         self.assertIn("of fixed versions rejected, the limit is 0.5%", failures["alpine-3.22"])
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,7 +58,9 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   forward (fetched from the live site and checked against their `builds/` record), so 3 builds stay live.
 - Gate before signing: the manifest's exact shape, canonical bytes, under 16 KB; release keys on the allowlist and
   the fixed `sources` shape; every named file present and matching its sha256; every release file's schema;
-  every file under 600 KB; no unexpected file, no symlink; the curated file re-validates.
+  every file under 600 KB; no unexpected file, no symlink; the curated file re-validates. The sign job repeats the
+  format ties inline: an `alpine-*` entry must be `apk`, every other `dpkg`; each release body's `format` must
+  equal its entry's; `sources.archive` may be empty only when every release is an Alpine one.
 
 ## Release files (`v1/r/`)
 
@@ -76,8 +78,8 @@ Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ub
 `-26.04`, `-26.10` (the current interim; 25.10 is end of life), `ubuntu-<lts>-esm` (the `Ubuntu:Pro:<lts>` rows,
 for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`, `alpine-3.20` .. `alpine-3.24` (`Alpine:v3.20` ..
 `Alpine:v3.24`). **alpine-3.20 (EOL 2026-04-01) and alpine-3.21 (EOL 2026-11-01) are past end of life**
-(alpinelinux.org/releases.json); they are kept for now, as their hosts still exist, and dropping them is an open
-decision.
+(alpinelinux.org/releases.json). James decided (2026-11-05) to keep them while secdb still publishes their
+branches; the app's S6 adds an end-of-life note for such hosts.
 
 ### Alpine (S4, `format: "apk"`)
 
@@ -91,15 +93,30 @@ Keyed by ORIGIN (`o:` in `/lib/apk/db/installed`; origin names may contain `_`).
 version: OSV Alpine gives the UPSTREAM version (`2.9.2`, below every `2.9.2-rN`), kept as is (18% of rows have one).
 Differences from the dpkg rules:
 
-- **Range rule**: a range's events are sorted by apk version (`"0"` lowest) and walked as OSV does; each
-  (introduced, the FIRST fixed after it) is one row. A later fixed of a closed range (`[0, f1, f2, f3]`) is
-  `redundant fixed`, and a fixed below its introduced (prosody `[13.0.0, 0.12.6-r0)`) an `empty range`: both
-  dropped and counted, not failures. Other event kinds or range types fail the release, as for dpkg.
-- **Rejects**: a date-shaped value, or one apk-tools' validator refuses, is rejected (fixed: `opensmtpd
-  6.6.2p1-r0`; introduced: `libdwarf 1999-12-14`, ImageMagick's own `7.0.0-0` / `6.9.10-54` scheme). Fixed and
-  date rejects count toward the 0.5% gate. Unparseable `introduced` values have their own 2% gate
-  (`INTRODUCED_REJECT_LIMIT`): ImageMagick alone is about 0.58% of Alpine rows, over the shared limit. Those
-  ImageMagick rows are dropped (a known false negative, not a false positive).
+- **Not-affected markers**: a range whose fixed is `"0"` or `"0-r0"` (secdb's "this branch never had it", e.g. db
+  CVE-2016-0682) is dropped whole and counted (`not-affected range (fixed 0) dropped`).
+- **`introduced` normalisation** (review H1, James 2026-11-05): an upstream `X.Y.Z-N` is the version aports writes
+  dotted, so ImageMagick's `7.0.0-0` / `6.9.10-54` and go's `1.21.0-0` become `7.0.0.0` / `6.9.10.54` /
+  `1.21.0.0` (`[7.0.0-0, 7.1.2.15-r0)` ships as `[7.0.0.0, 7.1.2.15-r0)`). Rejecting them, as the first S4 build
+  did, silently dropped current Critical ImageMagick fixes on alpine-3.24. Any other unparseable `introduced`
+  (dates: libdwarf `1999-12-14`, jq `2026-04-02`) is read as `"0"`, which widens the range to every version below
+  the fix. Both kinds are counted per release in the build log (`introduced: N normalised to the dotted form, M
+  unparseable read as "0" (x% of its fixed range events)`); the `"0"` kind has its own zip-wide 2% gate
+  (`INTRODUCED_REJECT_LIMIT`, as a share of the zip's fixed range events; the per-release share is in the log).
+- **Range rule**: a fixed value apk cannot order (`opensmtpd 6.6.2p1-r0`) is taken out of the range first, so it
+  can neither unsort the walk nor cost the range a good fix; it is rejected on its own. The remaining events are
+  sorted by apk version (`"0"` lowest) and walked as OSV does; each (introduced, the FIRST fixed after it) is one
+  row. A later fixed of a closed range (`[0, f1, f2, f3]`) is `redundant fixed`, and a fixed below its introduced
+  (prosody `[13.0.0, 0.12.6-r0)`) an `empty range`: both dropped and counted, not failures. Other event kinds or
+  range types fail the release, as for dpkg.
+- **First fixed only (OSV parity, review L3, kept deliberately).** `[0, f1, f2]` means affected below f1; the later
+  fixed events are redundant (secdb lists every release that mentions the CVE in `secfixes`). Real examples:
+  postgresql17 CVE-2026-2006 on alpine-3.21..3.24 is `[0, 17.8-r0, 17.9-r0]`, so a host on 17.8-r0 is not flagged
+  (17.9-r0 re-lists the CVE); postgresql16 on 3.20..3.24 is `[0, 16.12-r0, 16.13-r0]`; intel-ucode is
+  `[0, 20190514a-r0, 20190618-r0, 20191112-r0]`. A host between f1 and f2 is therefore not flagged, exactly as
+  OSV's own matcher answers.
+- **Rejects**: a date-shaped fixed value, or one apk-tools' validator refuses (`opensmtpd 6.6.2p1-r0`, `sudo
+  1.9.5p2-r0`), is rejected and counts toward the 0.5% gate.
 - **No baseline cut and no published check.** Alpine fixes come from secdb, which is built from each branch's
   aports `secfixes`, so a fix listed for a branch is in that branch's repository. There is no archive check yet:
   APKINDEX.tar.gz is RSA-signed with Alpine's keys, which the Python stdlib cannot verify. No release-day archive
@@ -113,7 +130,9 @@ Differences from the dpkg rules:
   /lib/apk/db/installed`, as uid 1000) from stock `alpine:3.20`, `alpine:3.20.0` and `alpine:latest`. They are
   matched against the shipped rows exactly as the app does (per origin the highest installed version;
   `introduced <= installed < fixed`). With no fix dates and no archive snapshot, a frozen image gains hits as
-  fixes land, so they are `atLeast` cases.
+  fixes land, so `alpine:3.20.0` and `alpine:latest` are `atLeast` cases; `alpine:3.20` (3.20.10, end of life)
+  flags nothing and is `exact: []`, the Alpine false-positive gate. Every apk case, `atLeast` too, fails on 3 or
+  more unexpected origins (`EXTRA_HIT_LIMIT`); 1 or 2 warn.
 
 **Adding a release** (every Ubuntu interim, every six months; the next is 27.04), in one pull request:
 

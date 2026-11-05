@@ -176,5 +176,94 @@ class SignJobCheck(unittest.TestCase):
         self.assertIn("sources.osv", result.stdout)
 
 
+def alpine_releases():
+    """ReleaseOptions whose S2 step writes one small, valid alpine-3.22 file and no dpkg release, so `sources`
+    has an EMPTY archive (no network)."""
+    from feedlib import content_name, sha256_hex
+    release = next(r for r in osvfeed.RELEASES if r.key == "alpine-3.22")
+
+    def builder(site_v1, log, previous, today):
+        rows = [{"source": "openssl", "introduced": "0", "fixed": "3.3.2-r0", "severity": 3,
+                 "ids": ["CVE-2024-1001"], "kernel": False, "date": None}]
+        data = osvfeed.body_bytes(osvfeed.release_body(release, rows))
+        name = "r/" + content_name("alpine-3.22", data)
+        os.makedirs(os.path.join(site_v1, "r"), exist_ok=True)
+        with open(os.path.join(site_v1, name), "wb") as handle:
+            handle.write(data)
+        return ({"alpine-3.22": {"format": "apk", "file": name, "sha256": sha256_hex(data), "bytes": len(data),
+                                 "rows": 1}},
+                {"osv": {"Alpine": "2026-11-05T09:30:02Z"}, "archive": {}, "baseline": {}}, {})
+    return build.ReleaseOptions(builder=builder)
+
+
+class SignJobFormats(unittest.TestCase):
+    """L4: the sign job's format ties: alpine-* entries must be apk, a release body's `format` must equal its
+    manifest entry's, and `sources.archive` may be empty only when every release is an Alpine one."""
+
+    def setUp(self):
+        self.repo = helpers.scratch_repo()
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.out = os.path.join(self.repo, "out")
+        self.manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                                       options=alpine_releases())
+        self.script = os.path.join(self.repo, "signcheck.py")
+        with open(self.script, "w") as handle:
+            handle.write(sign_check_script())
+
+    def run_check(self):
+        env = dict(os.environ, SITE=self.out, SERIAL=str(self.manifest["serial"]), DATE=NOW[:10])
+        return subprocess.run([sys.executable, "-I", self.script], cwd=self.repo, env=env, capture_output=True,
+                              text=True)
+
+    def edit_manifest(self, change):
+        path = os.path.join(self.out, "v1", "manifest.json")
+        with open(path) as handle:
+            manifest = json.load(handle)
+        change(manifest)
+        with open(path, "w") as handle:
+            json.dump(manifest, handle)
+
+    def test_all_alpine_feed_with_an_empty_archive_passes(self):
+        self.assertEqual(self.manifest["sources"]["archive"], {})
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 release file(s) match the manifest", result.stdout)
+
+    def test_empty_archive_refused_with_a_dpkg_release(self):
+        def add_dpkg(manifest):
+            entry = dict(manifest["releases"]["alpine-3.22"])
+            manifest["releases"]["debian-12"] = dict(entry, format="dpkg")
+            manifest["sources"]["osv"]["Debian"] = "2026-11-05T09:30:02Z"
+        self.edit_manifest(add_dpkg)
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sources.archive is not {suite: UTC time}", result.stdout)
+
+    def test_alpine_entry_must_be_apk(self):
+        self.edit_manifest(lambda m: m["releases"]["alpine-3.22"].update(format="dpkg"))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release alpine-3.22: bad entry", result.stdout)
+
+    def test_body_format_must_equal_the_entry(self):
+        # A body whose `format` disagrees with its (correct) entry: rewrite the file and re-pin its sha/name.
+        import hashlib
+        entry = self.manifest["releases"]["alpine-3.22"]
+        path = os.path.join(self.out, "v1", entry["file"])
+        with open(path, "rb") as handle:
+            body = json.loads(handle.read())
+        os.remove(path)
+        body["format"] = "dpkg"
+        data = osvfeed.body_bytes(body)
+        sha = hashlib.sha256(data).hexdigest()
+        name = f"r/alpine-3.22-{sha[:16]}.json"
+        with open(os.path.join(self.out, "v1", name), "wb") as handle:
+            handle.write(data)
+        self.edit_manifest(lambda m: m["releases"]["alpine-3.22"].update(file=name, sha256=sha, bytes=len(data)))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("says format 'dpkg', the manifest 'apk'", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
