@@ -73,6 +73,9 @@ class Config(unittest.TestCase):
         self.assertEqual(osvfeed.module_streams("Moderate: 389-ds:1.4 security update"), ["389-ds:1.4"])
         self.assertEqual(osvfeed.module_streams("Important: kernel security update"), [])
         self.assertEqual(osvfeed.module_streams(None), [])
+        # L7: the app's ReleaseIndex.isStream limit (64).
+        long = "a" * 60 + ":1234"
+        self.assertEqual(osvfeed.module_streams(f"Important: {long} and php:8.2 security update"), ["php:8.2"])
         self.assertEqual(osvfeed.alma_prefix_band("Critical: firefox security update"), 4)
         self.assertEqual(osvfeed.alma_prefix_band("Important: kernel security update"), 3)
         self.assertEqual(osvfeed.alma_prefix_band("Moderate: x"), 2)
@@ -294,6 +297,7 @@ class Body(unittest.TestCase):
         bad(lambda b: b["fixes"][0].__setitem__(3, [7]), "bad id indexes")
         bad(lambda b: b["fixes"][0].__setitem__(4, ["php:8.2"]), "bad streams")      # streams on a plain build
         bad(lambda b: b["fixes"][1].__setitem__(4, ["php 8.2"]), "bad streams")
+        bad(lambda b: b["fixes"][1].__setitem__(4, ["p" * 60 + ":8.22"]), "bad streams")      # over 64 (L7)
         bad(lambda b: b["pkgs"].update({"php-cli": [5]}), "bad fix indexes")
         bad(lambda b: b["pkgs"].update({"php-cli": []}), "bad fix indexes")
         bad(lambda b: b["pkgs"].pop("php-cli"), "a fix no binary names")
@@ -389,6 +393,11 @@ class Golden(unittest.TestCase):
         self.assertEqual(inv["php-cli"][2], "php:8.2:9080020260601000000:5708f44c")
         self.assertEqual(inv["NetworkManager"][1], "NetworkManager")
         self.assertNotIn("gpg-pubkey", inv)
+        # L7: a MODULARITYLABEL over 128 characters is no label (the app's limit).
+        with open(self.path, "w") as handle:
+            handle.write("php-cli\t0:8.2.31-1.module_el9.8.0+254+5708f44c\tx86_64\tphp-8.2.31-1.src.rpm\tphp:8.2:"
+                         + "9" * 130 + "\n")
+        self.assertIsNone(osvfeed.read_rpm_inventory(self.path)["php-cli"][2])
         with open(self.path, "w") as handle:
             handle.write("openssl\t1:3.5.5-2.el9_8\tx86_64\n")
         with self.assertRaises(FeedError):

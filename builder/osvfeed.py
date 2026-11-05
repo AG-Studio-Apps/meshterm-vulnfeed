@@ -474,11 +474,15 @@ _ALMA_PREFIX = {"critical": 4, "important": 3, "moderate": 2, "low": 1}
 _STREAM = re.compile(r"(?:^|(?<=[\s(]))([A-Za-z0-9][A-Za-z0-9_.+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*)(?=[\s,)]|\Z)")
 
 
+STREAM_MAX = 64     # a stream token's length limit, meshTerm's ReleaseIndex.isStream (app review L7)
+LABEL_MAX = 128     # a MODULARITYLABEL's, meshTerm's PackageInventory.parseRpm
+
+
 def module_streams(summary):
-    """The `name:stream` tokens of an EL advisory summary, sorted, no duplicates."""
+    """The `name:stream` tokens of an EL advisory summary, sorted, no duplicates, none over STREAM_MAX."""
     if not isinstance(summary, str):
         return []
-    return sorted({m.group(1).rstrip(".") for m in _STREAM.finditer(summary)})
+    return sorted({t for t in (m.group(1).rstrip(".") for m in _STREAM.finditer(summary)) if len(t) <= STREAM_MAX})
 
 
 # RHEL severity (review H1): each Red Hat advisory's own rating, the `#important` anchor of its classification link
@@ -1271,7 +1275,7 @@ def _check_rpm_tables(body, fail):
             fail(f"fix {fix!r}: bad id indexes")
         used_ids.update(refs)
         if not isinstance(streams, list) or streams != sorted(set(streams)) \
-                or not all(isinstance(x, str) and _STREAM_VALUE.match(x) for x in streams) \
+                or not all(isinstance(x, str) and len(x) <= STREAM_MAX and _STREAM_VALUE.match(x) for x in streams) \
                 or (streams and not rpmver.is_modular(fixed)):
             fail(f"fix {fix!r}: bad streams")
     for a, b in zip(fixes, fixes[1:]):
@@ -1382,7 +1386,8 @@ def read_rpm_inventory(path):
                 continue
             old = out.get(name)
             if old is None or rpmver.compare(evr, old[0]) > 0:
-                out[name] = (evr, source_rpm_name(srpm) or name, label if label and label != "(none)" else None)
+                out[name] = (evr, source_rpm_name(srpm) or name,
+                         label if label and label != "(none)" and len(label) <= LABEL_MAX else None)
     return out
 
 
