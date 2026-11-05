@@ -11,11 +11,24 @@
     "serial": {"type": "integer", "minimum": 1, "description": "The number in the trusted comment's version= token."},
     "version": {"type": "integer", "minimum": 1, "description": "Always equal to serial, so SignedArtifactVerifier.jsonVersion(of:) reads it."},
     "generated": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
-    "sources": {"type": "object", "description": "S2: OSV high-water time and archive Sources dates. Empty in S1."},
+    "sources": {
+      "type": "object",
+      "description": "Empty with no releases; otherwise exactly osv (newest OSV `modified` per ecosystem zip), archive (each suite's Release Date) and baseline (each release's release-day date).",
+      "additionalProperties": false,
+      "properties": {
+        "osv": {"type": "object", "propertyNames": {"enum": ["Debian", "Ubuntu"]},
+                "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},
+        "archive": {"type": "object", "propertyNames": {"pattern": "^[a-z]+(-updates|-security)?$"},
+                    "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},
+        "baseline": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}
+      }
+    },
     "releases": {
       "type": "object",
-      "description": "S2: release key -> file. Empty in S1 (curated-only).",
-      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9.-]{0,40}$"},
+      "description": "Release key -> its content-addressed file (body: {release, format, keyedBy, pkgs, kernel}, plan 4.1). Keys are the builder/osvfeed.py RELEASES allowlist.",
+      "propertyNames": {"enum": ["ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
+                                 "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
+                                 "debian-11", "debian-12", "debian-13"]},
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,

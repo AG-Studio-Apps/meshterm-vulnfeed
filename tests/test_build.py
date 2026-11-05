@@ -20,7 +20,8 @@ class BuildTests(unittest.TestCase):
 
     def run_build(self, now=NOW, live=None, carry=None):
         log = build.Log(echo=False)
-        manifest, record = build.build(self.repo, self.out, helpers.COMMIT, now, live, carry, log)
+        manifest, record = build.build(self.repo, self.out, helpers.COMMIT, now, live, carry, log,
+                                       helpers.no_releases())
         return manifest, record
 
     def commit_record(self, record):
@@ -111,7 +112,7 @@ class BuildTests(unittest.TestCase):
         with open(os.path.join(self.repo, "curated", "curated.json"), "ab") as handle:
             handle.write(b"\n")
         log = build.Log(echo=False)
-        build.build(self.repo, self.out, helpers.COMMIT, NOW, None, site, log)
+        build.build(self.repo, self.out, helpers.COMMIT, NOW, None, site, log, helpers.no_releases())
         self.assertFalse(os.path.exists(os.path.join(self.out, "v1", old)))
         self.assertTrue(any("sha256 does not match" in w for w in log.warnings))
 
@@ -123,9 +124,9 @@ class BuildTests(unittest.TestCase):
 
     def test_bad_commit_and_time_refused(self):
         with self.assertRaises(FeedError):
-            build.build(self.repo, self.out, "main", NOW)
+            build.build(self.repo, self.out, "main", NOW, options=helpers.no_releases())
         with self.assertRaises(FeedError):
-            build.build(self.repo, self.out, helpers.COMMIT, "2026-11-05 05:10")
+            build.build(self.repo, self.out, helpers.COMMIT, "2026-11-05 05:10", options=helpers.no_releases())
 
 
 class GateTests(unittest.TestCase):
@@ -133,7 +134,8 @@ class GateTests(unittest.TestCase):
         self.repo = helpers.scratch_repo()
         self.out = os.path.join(self.repo, "out")
         self.addCleanup(shutil.rmtree, self.repo)
-        self.manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False))
+        self.manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                                       options=helpers.no_releases())
         self.v1 = os.path.join(self.out, "v1")
 
     def rewrite(self, manifest):
@@ -159,6 +161,7 @@ class GateTests(unittest.TestCase):
             handle.write(big)
         manifest["releases"] = {"ubuntu-24.04": {"format": "dpkg", "file": name, "sha256": digest,
                                                  "bytes": len(big), "rows": 1}}
+        manifest["sources"] = helpers.FAKE_SOURCES
         self.rewrite(manifest)
         with self.assertRaisesRegex(FeedError, "at most"):
             build.gate(self.out, build.Log(echo=False))
@@ -190,9 +193,104 @@ class GateTests(unittest.TestCase):
             build.gate(self.out, build.Log(echo=False))
 
 
+class ReleaseTests(unittest.TestCase):
+    """The manifest and gate with S2 release files (a fake S2 step, no network)."""
+
+    def setUp(self):
+        self.repo = helpers.scratch_repo()
+        self.out = os.path.join(self.repo, "out")
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.seen = []
+        self.manifest, self.record = build.build(self.repo, self.out, helpers.COMMIT, NOW,
+                                                 log=build.Log(echo=False),
+                                                 options=helpers.fake_releases(self.seen))
+        self.v1 = os.path.join(self.out, "v1")
+
+    def rewrite(self, manifest):
+        with open(os.path.join(self.v1, "manifest.json"), "wb") as handle:
+            handle.write(dumps(manifest))
+
+    def test_release_entry_and_sources(self):
+        entry = self.manifest["releases"]["debian-12"]
+        self.assertEqual(set(entry), {"format", "file", "sha256", "bytes", "rows"})
+        with open(os.path.join(self.v1, entry["file"]), "rb") as handle:
+            data = handle.read()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])
+        self.assertEqual(entry["file"], f"r/debian-12-{entry['sha256'][:16]}.json")
+        self.assertEqual(entry["bytes"], len(data))
+        self.assertEqual(self.manifest["sources"], helpers.FAKE_SOURCES)
+        self.assertEqual(self.seen, [None], "the first build has no previous releases")
+
+    def test_previous_releases_passed_on(self):
+        with open(os.path.join(self.repo, "builds", "1.json"), "wb") as handle:
+            handle.write(dumps(self.record))
+        build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                    options=helpers.fake_releases(self.seen))
+        self.assertEqual(self.seen[-1], self.manifest["releases"])
+
+    def test_release_files_carried(self):
+        site = tempfile.mkdtemp(prefix="vulnfeed-live-")
+        self.addCleanup(shutil.rmtree, site)
+        shutil.copytree(self.out, site, dirs_exist_ok=True)
+        with open(os.path.join(self.repo, "builds", "1.json"), "wb") as handle:
+            handle.write(dumps(self.record))
+
+        def other(site_v1, log, previous):
+            return {}, {}
+        manifest, record = build.build(self.repo, self.out, helpers.COMMIT, NOW, None, site,
+                                       build.Log(echo=False), build.ReleaseOptions(builder=other))
+        self.assertIn(self.manifest["releases"]["debian-12"]["file"], record["carried"])
+
+    def test_gate_passes(self):
+        build.gate(self.out, build.Log(echo=False))
+
+    def test_tampered_release_file_fails(self):
+        entry = self.manifest["releases"]["debian-12"]
+        with open(os.path.join(self.v1, entry["file"]), "ab") as handle:
+            handle.write(b" ")
+        with self.assertRaisesRegex(FeedError, "sha256"):
+            build.gate(self.out, build.Log(echo=False))
+
+    def test_release_body_schema_checked(self):
+        entry = dict(self.manifest["releases"]["debian-12"])
+        body = {"release": "debian-12", "format": "dpkg", "keyedBy": "source",
+                "pkgs": {"apt": [["0", "2.6.2", 2, ["CVE-2026-109518"]]]}, "kernel": {}}
+        data = json.dumps(body).encode()
+        digest = hashlib.sha256(data).hexdigest()
+        name = f"r/debian-12-{digest[:16]}.json"
+        with open(os.path.join(self.v1, name), "wb") as handle:
+            handle.write(data)
+        os.remove(os.path.join(self.v1, entry["file"]))
+        entry.update(file=name, sha256=digest, bytes=len(data), rows=1)
+        self.rewrite(dict(self.manifest, releases={"debian-12": entry}))
+        with self.assertRaisesRegex(FeedError, "not High or Critical"):
+            build.gate(self.out, build.Log(echo=False))
+
+    def test_manifest_release_and_sources_shapes(self):
+        entry = self.manifest["releases"]["debian-12"]
+        cases = {
+            "not allowlisted": dict(self.manifest, releases={"debian-99": dict(entry)}),
+            "sources missing a key": dict(self.manifest, sources={"osv": {"Debian": "2026-11-05T13:03:11Z"}}),
+            "sources osv bad key": dict(self.manifest, sources=dict(helpers.FAKE_SOURCES,
+                                                                    osv={"Arch": "2026-11-05T13:03:11Z"})),
+            "sources archive bad time": dict(self.manifest, sources=dict(helpers.FAKE_SOURCES,
+                                                                         archive={"bookworm": "yesterday"})),
+            "sources baseline unknown": dict(self.manifest, sources=dict(helpers.FAKE_SOURCES,
+                                                                         baseline={"debian-99": "2023-06-10"})),
+            "sources without releases": dict(self.manifest, releases={}),
+        }
+        for label, manifest in cases.items():
+            with self.subTest(label=label):
+                self.rewrite(manifest)
+                with self.assertRaises(FeedError):
+                    build.gate(self.out, build.Log(echo=False))
+
+
 class SeamTests(unittest.TestCase):
-    def test_s1_releases_are_empty(self):
-        self.assertEqual(build.build_releases("/nonexistent", build.Log(echo=False)), ({}, {}))
+    def test_the_builder_option_replaces_s2(self):
+        options = build.ReleaseOptions(builder=lambda site_v1, log, previous: ({}, {"seen": previous}))
+        self.assertEqual(build.build_releases("/nonexistent", build.Log(echo=False), options, {"x": 1}),
+                         ({}, {"seen": {"x": 1}}))
 
 
 if __name__ == "__main__":

@@ -2,13 +2,15 @@
 """Builds the vulnfeed site: out/v1/manifest.json plus its content-addressed files. Python 3 stdlib only.
 
     build.py build --commit SHA [--out out] [--record record/build.json] [--now 2026-11-05T05:10:00Z]
-                   [--live-manifest FILE] [--carry-base URL_OR_DIR]
+                   [--live-manifest FILE] [--carry-base URL_OR_DIR] [--cache cache] [--work work] [--offline]
     build.py gate  [--out out]
+    build.py baseline --release debian-12 [--cache cache]     (writes builder/baselines/<release>.tsv)
+    build.py golden-archive [--cache cache]                    (writes builder/golden/*.archive.tsv)
 
 `build` writes, under --out (the Pages site root):
     v1/manifest.json                 the only signed file (scripts/sign.py, or the CI sign job, signs it)
     v1/curated-<sha256-16>.json      a byte copy of curated/curated.json, once it validates
-    v1/r/<release>-<sha256-16>.json  S2 (OSV release files); none in S1
+    v1/r/<release>-<sha256-16>.json  the OSV release files (builder/osvfeed.py)
 plus the files of the previous KEEP_BUILDS - 1 builds (read from builds/<serial>.json, fetched from
 --carry-base and checked against their recorded sha256), so a device holding an older manifest can still
 fetch what it names. It ends with the gate, and writes --record: the build log that CI commits as
@@ -20,6 +22,7 @@ make every device refuse the feed (same version, different body).
 """
 import argparse
 import datetime
+import json
 import os
 import re
 import shutil
@@ -30,6 +33,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from feedlib import (FILE_CAP, FILE_RE, GENERATED_RE, KEEP_BUILDS, MANIFEST_CAP, MANIFEST_SCHEMA,  # noqa: E402
                      FeedError, content_name, dumps, is_int, loads_strict, sha256_hex)
+import osvfeed  # noqa: E402
 import validate_curated  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,21 +63,23 @@ class Log:
             print(f"::warning::{text}")
 
 
-# --- S2 seam -------------------------------------------------------------------------------------------
-def build_releases(site_v1, log):
-    """S2: the OSV builder. Returns (releases, sources) for the manifest.
+# --- S2: the OSV release files -------------------------------------------------------------------------
+class ReleaseOptions:
+    """Where the S2 builder caches downloads and writes its intermediates. `builder` replaces the OSV
+    builder (tests); it takes (site_v1, log, previous) and returns (releases, sources)."""
 
-    `releases` maps a release key (`ubuntu-24.04`, `debian-12`, ...) to
-    {"format": "dpkg"|"apk"|"rpm", "file": "r/<release>-<sha256-16>.json", "sha256": <hex>, "bytes": N,
-     "rows": N}, each file written under site_v1/r/ with feedlib.content_name(). `sources` records the OSV
-    high-water time and the archive Sources dates (plan 4.1/4.2). S2 also adds its gates here: per-release
-    row counts within +-30% of the previous build, rejected versions under 0.5%, unknown range shapes = 0,
-    and the golden fixtures.
+    def __init__(self, cache="cache", work="work", offline=False, builder=None):
+        self.cache, self.work, self.offline, self.builder = cache, work, offline, builder
 
-    S1 is curated-only: no release files, empty `releases` and `sources`.
-    """
-    log.info("releases: none (S1 is curated-only; the OSV builder is S2)")
-    return {}, {}
+
+def build_releases(site_v1, log, options, previous):
+    """The OSV builder (builder/osvfeed.py). Returns (releases, sources) for the manifest; each release file
+    is written under site_v1/r/ with feedlib.content_name(). `previous` is the previous build's manifest
+    `releases` (None when there is none), for the row-count gate."""
+    if options.builder is not None:
+        return options.builder(site_v1, log, previous)
+    return osvfeed.build_releases(site_v1, log, options.cache, options.work, previous=previous,
+                                  offline=options.offline)
 
 
 # --- history -------------------------------------------------------------------------------------------
@@ -187,14 +193,13 @@ def check_manifest(manifest):
     if not isinstance(generated, str) or not GENERATED_RE.fullmatch(generated):
         raise FeedError("generated must be UTC ISO 8601 like 2026-11-05T05:10:00Z")
     datetime.datetime.strptime(generated, "%Y-%m-%dT%H:%M:%SZ")
-    if not isinstance(manifest["sources"], dict):
-        raise FeedError("sources must be an object")
+    check_sources(manifest["sources"], manifest["releases"])
     releases = manifest["releases"]
     if not isinstance(releases, dict):
         raise FeedError("releases must be an object")
     for key, entry in releases.items():
-        if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,40}", key):
-            raise FeedError(f"bad release key {key!r}")
+        if key not in osvfeed.RELEASE_KEYS:
+            raise FeedError(f"release key {key!r} is not in the allowlist")
         if not isinstance(entry, dict) or set(entry) != RELEASE_KEYS:
             raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)}")
         if entry["format"] not in RELEASE_FORMATS:
@@ -217,6 +222,34 @@ def check_manifest(manifest):
         raise FeedError("curated sha256 is malformed or does not match its file name")
 
 
+ISO_Z_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+SUITE_RE = re.compile(r"^[a-z]+(-updates|-security)?$")
+
+
+def check_sources(sources, releases):
+    """`sources` is {} with no releases, else exactly {osv, archive, baseline} (plan 4.1)."""
+    if not isinstance(sources, dict):
+        raise FeedError("sources must be an object")
+    if not releases:
+        if sources:
+            raise FeedError("sources must be empty when there are no releases")
+        return
+    if set(sources) != {"osv", "archive", "baseline"}:
+        raise FeedError(f"sources keys {sorted(sources)} != ['archive', 'baseline', 'osv']")
+    osv, archive, baseline = sources["osv"], sources["archive"], sources["baseline"]
+    if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu"} \
+            or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in osv.values()):
+        raise FeedError("sources.osv must map Debian/Ubuntu to a UTC time")
+    if not isinstance(archive, dict) or not archive or len(archive) > 64 \
+            or not all(isinstance(k, str) and SUITE_RE.fullmatch(k) for k in archive) \
+            or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in archive.values()):
+        raise FeedError("sources.archive must map suite names to UTC times")
+    if not isinstance(baseline, dict) or not set(baseline) <= set(osvfeed.RELEASE_KEYS) \
+            or not all(isinstance(v, str) and DAY_RE.fullmatch(v) for v in baseline.values()):
+        raise FeedError("sources.baseline must map release keys to dates")
+
+
 def gate(out_dir, log):
     """Checks a built site before anything signs it. Raises FeedError."""
     site_v1 = os.path.join(out_dir, "v1")
@@ -235,13 +268,19 @@ def gate(out_dir, log):
         if not os.path.isfile(file_path) or os.path.islink(file_path):
             raise FeedError(f"manifest names {rel}, which is not in the site")
         with open(file_path, "rb") as handle:
-            data = handle.read()
+            data = handle.read(FILE_CAP + 1)
+        if len(data) > FILE_CAP:
+            raise FeedError(f"{rel} is over {FILE_CAP} bytes, at most {FILE_CAP}")
         if sha256_hex(data) != sha:
             raise FeedError(f"{rel}: sha256 does not match the manifest")
         if rel in sizes and sizes[rel] != len(data):
             raise FeedError(f"{rel}: {len(data)} bytes, the manifest says {sizes[rel]}")
     with open(os.path.join(site_v1, manifest["curated"]["file"]), "rb") as handle:
         validate_curated.load_and_validate(handle.read())
+    for key, entry in sorted(manifest["releases"].items()):
+        with open(os.path.join(site_v1, entry["file"]), "rb") as handle:
+            body = loads_strict(handle.read())
+        osvfeed.check_release_body(body, key, entry)
     total = 0
     for root, dirs, files in os.walk(out_dir):
         for name in dirs + files:
@@ -262,8 +301,9 @@ def gate(out_dir, log):
 
 
 # --- build ---------------------------------------------------------------------------------------------
-def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, log=None):
+def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, log=None, options=None):
     log = log or Log(echo=False)
+    options = options or ReleaseOptions()
     if not COMMIT_RE.fullmatch(commit):
         raise FeedError("--commit must be a 40-hex commit id")
     if not GENERATED_RE.fullmatch(now):
@@ -286,7 +326,11 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
         handle.write(curated_bytes)
     log.info(f"curated: {len(curated_doc['rules'])} rule(s) -> {curated_name}")
 
-    releases, sources = build_releases(site_v1, log)
+    previous = None
+    for _, record in past:
+        previous = (record.get("manifest") or {}).get("releases") or None
+        break
+    releases, sources = build_releases(site_v1, log, options, previous)
 
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -328,6 +372,14 @@ def main(argv=None):
     b.add_argument("--now", default=None)
     b.add_argument("--live-manifest", help="the live manifest.json (fetched by CI), for the serial floor")
     b.add_argument("--carry-base", help="site root (URL or directory) to carry the previous builds' files from")
+    b.add_argument("--cache", default="cache", help="download cache (OSV zips, archive Sources); keep it between runs")
+    b.add_argument("--work", default="work", help="intermediates: every shipped row with its publish date")
+    b.add_argument("--offline", action="store_true", help="use the cache only (local re-runs)")
+    bl = sub.add_parser("baseline", help="write builder/baselines/<release>.tsv from snapshot.debian.org")
+    bl.add_argument("--release", required=True, choices=[r.key for r in osvfeed.RELEASES if r.snapshot])
+    bl.add_argument("--cache", default="cache")
+    ga = sub.add_parser("golden-archive", help="write the archive-at-capture file of each golden case")
+    ga.add_argument("--cache", default="cache")
     g = sub.add_parser("gate")
     g.add_argument("--out", default="out")
     args = parser.parse_args(argv)
@@ -337,12 +389,24 @@ def main(argv=None):
         if args.command == "gate":
             gate(args.out, log)
             return 0
+        if args.command == "golden-archive":
+            with open(os.path.join(osvfeed.GOLDEN_DIR, "expected.json"), encoding="utf-8") as handle:
+                cases = json.load(handle)["cases"]
+            for case in cases:
+                if case.get("archive"):
+                    osvfeed.write_golden_archive(case, args.cache, log)
+            return 0
+        if args.command == "baseline":
+            release = next(r for r in osvfeed.RELEASES if r.key == args.release)
+            osvfeed.write_baseline(release, args.cache, log)
+            return 0
         live = None
         if args.live_manifest:
             with open(args.live_manifest, "rb") as handle:
                 live = loads_strict(handle.read())
+        options = ReleaseOptions(args.cache, args.work, args.offline)
         manifest, record = build(args.repo_root, args.out, args.commit, args.now or utc_now(),
-                                 live, args.carry_base, log)
+                                 live, args.carry_base, log, options)
     except (OSError, FeedError, ValueError) as error:
         print(f"::error::build failed: {error}", file=sys.stderr)
         return 1

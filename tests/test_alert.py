@@ -62,7 +62,8 @@ class AlertTests(unittest.TestCase):
         self.repo = helpers.scratch_repo()
         self.addCleanup(shutil.rmtree, self.repo)
         self.site = os.path.join(self.repo, "out")
-        build.build(self.repo, self.site, helpers.COMMIT, GENERATED, log=build.Log(echo=False))
+        build.build(self.repo, self.site, helpers.COMMIT, GENERATED, log=build.Log(echo=False),
+                    options=helpers.no_releases())
         self.manifest = os.path.join(self.site, "v1", "manifest.json")
 
     def sign_with(self, key, role="feed"):

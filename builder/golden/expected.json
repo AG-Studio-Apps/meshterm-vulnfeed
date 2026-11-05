@@ -1,0 +1,55 @@
+{
+ "note": [
+  "Golden fixtures (plan 4.2). A case counts a row when its fix date is before `capture` AND its fixed version was in",
+  "the archive at `archiveAt` (the `archive` file, from snapshot.ubuntu.com / snapshot.debian.org), so later OSV",
+  "records never move a frozen fixture. Kernel rows are not counted (the pill never counts a pending kernel).",
+  "Stock ubuntu:24.04 (sha256:fe81560990fa..., created 2026-10-25) and stock debian:12 both flag apt for",
+  "CVE-2026-109518 (CVSS 4.0 High): USN-8996-1 2026-11-04 13:37 UTC, apt 2.8.4ubuntu0.1 published to noble-security",
+  "2026-11-04 14:25 UTC (Launchpad); Debian apt 2.6.2 in the bookworm archive at the capture snapshot. Both images",
+  "predate the fix, so both are real pending updates at capture time.",
+  "debian:12.0: the S0 prototype (scripts/match.py, all severities) flags 18 sources: these 11 plus gcc-12,",
+  "libgcrypt20, libtasn1-6, sed, shadow, tar, util-linux, whose fixes are all Medium or Low (D6 drops them)."
+ ],
+ "cases": [
+  {
+   "fixture": "ubuntu-24.04-stock.tsv",
+   "release": "ubuntu-24.04",
+   "capture": "2026-11-05",
+   "archiveAt": "20261105T150000Z",
+   "archive": "ubuntu-24.04-stock.archive.tsv",
+   "exact": [
+    "apt"
+   ]
+  },
+  {
+   "fixture": "debian-12-stock.tsv",
+   "release": "debian-12",
+   "capture": "2026-11-05",
+   "archiveAt": "20261105T080000Z",
+   "archive": "debian-12-stock.archive.tsv",
+   "exact": [
+    "apt"
+   ]
+  },
+  {
+   "fixture": "debian-12.0-20230612.tsv",
+   "release": "debian-12",
+   "capture": "2026-11-05",
+   "archiveAt": "20261105T080000Z",
+   "archive": "debian-12.0-20230612.archive.tsv",
+   "atLeast": [
+    "apt",
+    "dpkg",
+    "glibc",
+    "gnupg2",
+    "gnutls28",
+    "libcap2",
+    "pam",
+    "pcre2",
+    "perl",
+    "systemd",
+    "xz-utils"
+   ]
+  }
+ ]
+}

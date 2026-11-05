@@ -31,7 +31,8 @@ class SignTests(unittest.TestCase):
         self.repo = helpers.scratch_repo()
         self.addCleanup(shutil.rmtree, self.repo)
         self.out = os.path.join(self.repo, "out")
-        build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False))
+        build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                    options=helpers.no_releases())
         self.manifest = os.path.join(self.out, "v1", "manifest.json")
 
     def read(self, path):
