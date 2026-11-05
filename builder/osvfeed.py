@@ -33,10 +33,11 @@ Then, per release, with the archive Sources of every pocket and component loaded
 
 Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
 1. A range with a not-affected marker (fixed "0" / "0-r0") is dropped whole and counted. Each `introduced` is
-   normalised (1a): an upstream X.Y.Z-N (ImageMagick 7.0.0-0) becomes the dotted X.Y.Z.N aports writes, any
-   other unparseable value (a date) becomes "0"; both are counted, and the "0" kind is gated
-   (INTRODUCED_REJECT_LIMIT). A fixed value apk cannot order is taken out of the walk and kept as a pair of its
-   own for resolve() to reject. The remaining events are sorted by apk version ("0" lowest) and walked as OSV
+   normalised (1a): an imagemagick upstream X.Y.Z-N (7.0.0-0) becomes the dotted X.Y.Z.N aports writes, another
+   origin's X.Y.Z-0 (go 1.21.0-0) plain X.Y.Z, any other unparseable value (a date) "0"; all are counted, and the
+   "0" kind is gated (INTRODUCED_REJECT_LIMIT). A fixed value apk cannot order is taken out of the walk and kept as
+   a pair of its own for resolve() to reject; an introduced that then follows an open one restarts the range there
+   (the earlier range ends at its bad fix), never widening it. The remaining events are sorted by apk version ("0" lowest) and walked as OSV
    does: introduced opens, fixed closes; each (introduced, the FIRST fixed after it) is one row (OSV parity:
    postgresql17 CVE-2026-2006 [0, 17.8-r0, 17.9-r0] is affected below 17.8-r0 only). A fixed with no open
    introduced (the 2nd/3rd fixed of [0, f1, f2, f3], or a fixed below its introduced) is dropped and counted,
@@ -255,31 +256,43 @@ def _apk_event_key(event):
 # Not-affected markers: a range whose fixed is "0" / "0-r0" says the package never had the bug (secdb lists a
 # CVE with fix "0" for a branch that was never affected). Such a range is dropped whole and counted.
 NOT_AFFECTED_FIXED = ("0", "0-r0")
-# OSV Alpine `introduced` values apk cannot parse (rule 1a of the Alpine notes): an upstream `X.Y.Z-N` (ImageMagick
-# 7.0.0-0, 6.9.10-54; go 1.21.0-0) is the same version aports writes dotted (imagemagick 7.1.2.15-r0), so it is
-# normalised to that; anything else (libdwarf 1999-12-14, jq 2026-04-02: dates, not versions) becomes "0".
+# OSV Alpine `introduced` values apk cannot parse (rule 1a of the Alpine notes). An upstream `X.Y.Z-N` is normalised
+# only where the meaning is known (review L4): ImageMagick's `7.0.0-0` / `6.9.10-54` are the versions aports writes
+# dotted (imagemagick 7.1.2.15-r0), so the imagemagick origins get `X.Y.Z.N`; any other origin's `X.Y.Z-0` (go
+# 1.21.0-0, a semver "lowest 1.21.0" marker) becomes plain `X.Y.Z`, since the dotted `1.21.0.0` sorts ABOVE go's own
+# 1.21.0-r0 and would miss it. Anything else (libdwarf 1999-12-14, jq 2026-04-02: dates, not versions; another
+# origin's X.Y.Z-N with N > 0) becomes "0".
 _UPSTREAM_DASHED = re.compile(r"^\d+(\.\d+)*-\d+$")
+_DOTTED_UPSTREAM = re.compile(r"^imagemagick\d*(-.*)?$")
 INTRO_NORMALISED = "introduced normalised (X.Y.Z-N -> X.Y.Z.N)"
+INTRO_DASH_ZERO = "introduced X.Y.Z-0 read as X.Y.Z"
 INTRO_ZEROED = "introduced unparseable -> 0"
 NOT_AFFECTED = "not-affected range (fixed 0) dropped"
 BAD_FIXED = "bad fixed event kept apart (range walked without it)"
+INTRO_REOPENED = "introduced while open (its fixed was bad): range restarted at the later introduced"
 
 
 def _apk_ok(value):
     return apkver.validate(value) and not _DATE_SHAPED.match(value)
 
 
-def normalise_apk_introduced(value, counters=None):
-    """An Alpine `introduced` as apk can compare it (rule 1a): "0" and valid apk versions unchanged, an upstream
-    `X.Y.Z-N` dotted, anything else "0". `counters` counts the two kinds of change."""
+def normalise_apk_introduced(value, counters=None, origin=None):
+    """An Alpine `introduced` as apk can compare it (rule 1a): "0" and valid apk versions unchanged; an upstream
+    `X.Y.Z-N` dotted for the imagemagick origins; another origin's `X.Y.Z-0` as `X.Y.Z`; anything else "0".
+    `counters` counts the three kinds of change."""
     if value == "0" or _apk_ok(value):
         return value
     if not _DATE_SHAPED.match(value) and _UPSTREAM_DASHED.match(value):
-        dotted = value.replace("-", ".")
-        if _apk_ok(dotted):
+        if isinstance(origin, str) and _DOTTED_UPSTREAM.match(origin):
+            changed, counter = value.replace("-", "."), INTRO_NORMALISED
+        elif value.endswith("-0"):
+            changed, counter = value[:-2], INTRO_DASH_ZERO
+        else:
+            changed = counter = None
+        if changed is not None and _apk_ok(changed):
             if counters is not None:
-                counters[INTRO_NORMALISED] += 1
-            return dotted
+                counters[counter] += 1
+            return changed
     if counters is not None:
         counters[INTRO_ZEROED] += 1
     return "0"
@@ -301,7 +314,8 @@ def apk_range_pairs(affected, counters):
         if any(k == "fixed" and v in NOT_AFFECTED_FIXED for k, v in events):
             counters[NOT_AFFECTED] += 1
             continue
-        events = [(k, normalise_apk_introduced(v, counters) if k == "introduced" else v) for k, v in events]
+        origin = (affected.get("package") or {}).get("name")
+        events = [(k, normalise_apk_introduced(v, counters, origin) if k == "introduced" else v) for k, v in events]
         # A fixed value apk cannot order (opensmtpd 6.6.2p1-r0) is kept out of the walk, so one bad event never
         # unsorts the range or costs it a good fix; it becomes a pair of its own (with the introduced it followed
         # in the given order) for resolve_apk() to reject and count toward REJECT_LIMIT.
@@ -321,9 +335,10 @@ def apk_range_pairs(affected, counters):
                 if introduced is not None:
                     if not bad:
                         raise ShapeError("introduced twice without a fixed between")
-                    # The fixed between them was a bad value kept apart: the range stays open from the lower.
-                    counters["introduced while open (its fixed was bad)"] += 1
-                    continue
+                    # The fixed between them was a bad value kept apart (review L5): the earlier range ends at that
+                    # bad fix, already a pair of its own (rejected and counted), and a new range starts here. Keeping
+                    # the lower introduced open instead would widen the later range over the gap between them.
+                    counters[INTRO_REOPENED] += 1
                 introduced = value
             elif introduced is None:
                 counters["redundant fixed" if closed_any else "empty range (fixed below introduced)"] += 1
@@ -1456,7 +1471,9 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         events = stats[f"{release.key}: fixed rows"]
         zeroed = stats[f"{release.key}: {INTRO_ZEROED}"]
         log.info(f"{release.key}: introduced: {stats[f'{release.key}: {INTRO_NORMALISED}']} normalised to the "
-                 f"dotted form, {zeroed} unparseable read as \"0\" ({zeroed / events if events else 0:.3%} of its "
+                 f"dotted form, {stats[f'{release.key}: {INTRO_DASH_ZERO}']} X.Y.Z-0 read as X.Y.Z, "
+                 f"{stats[f'{release.key}: {INTRO_REOPENED}']} range(s) restarted after a bad fix, "
+                 f"{zeroed} unparseable read as \"0\" ({zeroed / events if events else 0:.3%} of its "
                  f"{events} fixed range events); {stats[f'{release.key}: {NOT_AFFECTED}']} not-affected range(s) "
                  f"dropped; {stats[f'{release.key}: {BAD_FIXED}']} bad fixed event(s) kept apart")
     kernels = sorted({r["source"] for r in rows if r["kernel"]})

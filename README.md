@@ -95,16 +95,21 @@ Differences from the dpkg rules:
 
 - **Not-affected markers**: a range whose fixed is `"0"` or `"0-r0"` (secdb's "this branch never had it", e.g. db
   CVE-2016-0682) is dropped whole and counted (`not-affected range (fixed 0) dropped`).
-- **`introduced` normalisation** (review H1, James 2026-11-05): an upstream `X.Y.Z-N` is the version aports writes
-  dotted, so ImageMagick's `7.0.0-0` / `6.9.10-54` and go's `1.21.0-0` become `7.0.0.0` / `6.9.10.54` /
-  `1.21.0.0` (`[7.0.0-0, 7.1.2.15-r0)` ships as `[7.0.0.0, 7.1.2.15-r0)`). Rejecting them, as the first S4 build
-  did, silently dropped current Critical ImageMagick fixes on alpine-3.24. Any other unparseable `introduced`
-  (dates: libdwarf `1999-12-14`, jq `2026-04-02`) is read as `"0"`, which widens the range to every version below
-  the fix. Both kinds are counted per release in the build log (`introduced: N normalised to the dotted form, M
-  unparseable read as "0" (x% of its fixed range events)`); the `"0"` kind has its own zip-wide 2% gate
-  (`INTRODUCED_REJECT_LIMIT`, as a share of the zip's fixed range events; the per-release share is in the log).
+- **`introduced` normalisation** (review H1, James 2026-11-05; narrowed by review L4): an imagemagick origin's
+  upstream `X.Y.Z-N` is the version aports writes dotted, so `7.0.0-0` / `6.9.10-54` become `7.0.0.0` / `6.9.10.54`
+  (`[7.0.0-0, 7.1.2.15-r0)` ships as `[7.0.0.0, 7.1.2.15-r0)`). Rejecting them, as the first S4 build did, silently
+  dropped current Critical ImageMagick fixes on alpine-3.24. Any other origin's `X.Y.Z-0` (go's `1.21.0-0`, semver's
+  "lowest 1.21.0") becomes plain `1.21.0`: the dotted `1.21.0.0` sorts above go's own `1.21.0-r0` and would miss
+  it. Any other unparseable `introduced` (dates: libdwarf `1999-12-14`, jq `2026-04-02`; another origin's `X.Y.Z-N`
+  with N > 0, none on 2026-11-05) is read as `"0"`, which widens the range to every version below the fix. All
+  kinds are counted per release in the build log (`introduced: N normalised to the dotted form, N X.Y.Z-0 read as
+  X.Y.Z, N range(s) restarted after a bad fix, M unparseable read as "0" (x% of its fixed range events)`); the
+  `"0"` kind has its own zip-wide 2% gate (`INTRODUCED_REJECT_LIMIT`, as a share of the zip's fixed range events;
+  the per-release share is in the log). On the 2026-11-05 zip: 480 imagemagick values dotted, 6 go values.
 - **Range rule**: a fixed value apk cannot order (`opensmtpd 6.6.2p1-r0`) is taken out of the range first, so it
-  can neither unsort the walk nor cost the range a good fix; it is rejected on its own. The remaining events are
+  can neither unsort the walk nor cost the range a good fix; it is rejected on its own, and an introduced that then
+  follows an open one restarts the range there (review L5): `[0, 1.0p1-r0, 2.0, 2.1-r0]` ships `[2.0, 2.1-r0)` and
+  rejects `[0, 1.0p1-r0)`, never the widened `[0, 2.1-r0)` (counted as `introduced while open`). The remaining events are
   sorted by apk version (`"0"` lowest) and walked as OSV does; each (introduced, the FIRST fixed after it) is one
   row. A later fixed of a closed range (`[0, f1, f2, f3]`) is `redundant fixed`, and a fixed below its introduced
   (prosody `[13.0.0, 0.12.6-r0)`) an `empty range`: both dropped and counted, not failures. Other event kinds or

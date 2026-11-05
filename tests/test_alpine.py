@@ -24,9 +24,10 @@ def entry(*events):
 
 
 class RangeRule(unittest.TestCase):
-    def pairs(self, *events):
+    def pairs(self, *events, name="imagemagick"):
         counters = collections.Counter()
-        return osvfeed.apk_range_pairs(entry(*events), counters), counters
+        affected = dict(entry(*events), package={"ecosystem": "Alpine:v3.22", "name": name})
+        return osvfeed.apk_range_pairs(affected, counters), counters
 
     def test_single_and_introduced_kept(self):
         self.assertEqual(self.pairs(("introduced", "0"), ("fixed", "3.3.2-r0"))[0], [("0", "3.3.2-r0")])
@@ -62,8 +63,18 @@ class RangeRule(unittest.TestCase):
         self.assertEqual(counters[osvfeed.INTRO_NORMALISED], 1)
         pairs, _ = self.pairs(("introduced", "6.9.10-54"), ("fixed", "7.0.8.56-r0"))
         self.assertEqual(pairs, [("6.9.10.54", "7.0.8.56-r0")])
-        pairs, _ = self.pairs(("introduced", "1.21.0-0"), ("fixed", "1.21.5-r0"))       # go
-        self.assertEqual(pairs, [("1.21.0.0", "1.21.5-r0")])
+        # L4: only the imagemagick origins are dotted. go's 1.21.0-0 is "lowest 1.21.0": dotted it would sort above
+        # go's own 1.21.0-r0 and miss it, so it is read as plain 1.21.0.
+        pairs, counters = self.pairs(("introduced", "1.21.0-0"), ("fixed", "1.21.5-r0"), name="go")
+        self.assertEqual(pairs, [("1.21.0", "1.21.5-r0")])
+        self.assertEqual((counters[osvfeed.INTRO_DASH_ZERO], counters[osvfeed.INTRO_NORMALISED]), (1, 0))
+        self.assertLess(osvfeed.apkver.compare("1.21.0", "1.21.0-r0"), 1, "1.21.0-r0 is in the range")
+        self.assertGreater(osvfeed.apkver.compare("1.21.0.0", "1.21.0-r0"), 0, "the dotted form would miss it")
+        pairs, counters = self.pairs(("introduced", "1.21.0-3"), ("fixed", "1.21.5-r0"), name="go")
+        self.assertEqual(pairs, [("0", "1.21.5-r0")], "another origin's X.Y.Z-N (N > 0) has no known meaning")
+        self.assertEqual(counters[osvfeed.INTRO_ZEROED], 1)
+        pairs, counters = self.pairs(("introduced", "6.9.10-54"), ("fixed", "6.9.13.10-r0"), name="imagemagick6")
+        self.assertEqual(pairs, [("6.9.10.54", "6.9.13.10-r0")])
         for date in ("1999-12-14", "2026-04-02", "abc def"):                              # libdwarf, jq
             pairs, counters = self.pairs(("introduced", date), ("fixed", "0.6.0-r0"))
             self.assertEqual(pairs, [("0", "0.6.0-r0")], date)
@@ -90,11 +101,20 @@ class RangeRule(unittest.TestCase):
         self.assertEqual(pairs, [("0", "6.6.4-r0"), ("0", "6.6.4p1-r1")])
         self.assertEqual(counters["redundant fixed"], 1)
         self.assertEqual(counters[osvfeed.BAD_FIXED], 1)
-        # A bad fixed between two ranges: the range stays open from the lower introduced, never a shape error.
+        # L5: a bad fixed between two ranges: the earlier range ends at the bad fix (its own pair, rejected later)
+        # and the later one restarts at its introduced. Never a shape error, and never the widened [0, 2.1-r0).
         pairs, counters = self.pairs(("introduced", "0"), ("fixed", "1.0p1-r0"), ("introduced", "2.0"),
                                      ("fixed", "2.1-r0"))
-        self.assertEqual(pairs, [("0", "2.1-r0"), ("0", "1.0p1-r0")])
-        self.assertEqual(counters["introduced while open (its fixed was bad)"], 1)
+        self.assertEqual(pairs, [("2.0", "2.1-r0"), ("0", "1.0p1-r0")])
+        self.assertEqual(counters[osvfeed.INTRO_REOPENED], 1)
+        # A host at 1.5-r0 (between the ranges) is not in the shipped [2.0, 2.1-r0).
+        self.assertLess(osvfeed.apkver.compare("1.5-r0", "2.0"), 0)
+        # The bad fix in the later range: the earlier one closes normally, the later stays open (no row), and
+        # its bad pair is rejected on its own.
+        pairs, counters = self.pairs(("introduced", "0"), ("fixed", "1.0-r0"), ("introduced", "2.0"),
+                                     ("fixed", "2.1p1-r0"))
+        self.assertEqual(pairs, [("0", "1.0-r0"), ("2.0", "2.1p1-r0")])
+        self.assertEqual(counters[osvfeed.INTRO_REOPENED], 0)
 
     def test_unknown_shapes_raise(self):
         for bad in (entry(("introduced", "0"), ("last_affected", "1.0-r0")),
@@ -486,7 +506,8 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(failures, {})
         self.assertEqual(releases["alpine-3.22"]["rows"], 2)
         # L6: the per-release share is in the build log.
-        self.assertTrue(any(line.startswith("alpine-3.22: introduced: 1 normalised to the dotted form, 0 "
+        self.assertTrue(any(line.startswith("alpine-3.22: introduced: 1 normalised to the dotted form, 0 X.Y.Z-0 "
+                                            "read as X.Y.Z, 0 range(s) restarted after a bad fix, 0 "
                                             "unparseable read as") for line in log.lines), log.lines)
         self.write_osv([
             record("ALPINE-CVE-2024-1001", [affected(ECO, "openssl", [{"introduced": "0"}, {"fixed": "3.3.2-r0"}])],
