@@ -127,7 +127,7 @@ def compare(a, b):
 sort_key = functools.cmp_to_key(compare)
 
 
-_MODULAR = re.compile(r"\.module[_+]el|module\+el")
+_MODULAR = re.compile(r"\.module_el|module\+el")       # the same test as meshTerm's RpmVersion.isModular
 
 
 def is_modular(text):
