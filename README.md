@@ -134,7 +134,12 @@ Differences from the dpkg rules:
 - **Range rule**: a fixed value apk cannot order (`opensmtpd 6.6.2p1-r0`) is taken out of the range first, so it
   can neither unsort the walk nor cost the range a good fix; it is rejected on its own, and an introduced that then
   follows an open one restarts the range there (review L5): `[0, 1.0p1-r0, 2.0, 2.1-r0]` ships `[2.0, 2.1-r0)` and
-  rejects `[0, 1.0p1-r0)`, never the widened `[0, 2.1-r0)` (counted as `introduced while open`). The remaining events are
+  rejects `[0, 1.0p1-r0)`, never the widened `[0, 2.1-r0)` (counted as `range(s) restarted after a bad fix`). The
+  trade-off, chosen deliberately: a host BELOW the bad fix (here below `1.0p1-r0`) is not flagged for that CVE,
+  since its range is the rejected one, in exchange for never flagging a host in the gap between the bad fix and the
+  next introduced (`[1.0p1-r0, 2.0)`), which the widened range would flag although secdb says it is fixed. Widening
+  turns one unorderable value into false positives on every host in the gap; restarting loses only the hosts old
+  enough to predate a fix apk cannot even order. None on the 2026-11-05 zip (Alpine 3.20 to 3.24). The remaining events are
   sorted by apk version (`"0"` lowest) and walked as OSV does; each (introduced, the FIRST fixed after it) is one
   row. A later fixed of a closed range (`[0, f1, f2, f3]`) is `redundant fixed`, and a fixed below its introduced
   (prosody `[13.0.0, 0.12.6-r0)`) an `empty range`: both dropped and counted, not failures. Other event kinds or
@@ -209,21 +214,49 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
   CVSS, else Medium (not shipped). Never the zip-wide CVSS of an id: that is the worst score ANY Red Hat product's
   advisory gave it (OpenShift, RHEL 7 ...). On the 2026-11-05 zip it shipped 619 of 846 RHEL 9 Moderate advisories and
   27 of 70 Low ones as High or Critical, and 10 Important ones as Medium; rated by Red Hat, RHEL and Alma now agree
-  (rockylinux:9.3 and almalinux:9.2 flag the same 22 source rpms).
+  (rockylinux:9.3 and almalinux:9.2 flag the same 22 source rpms). **Id lists are per advisory, not per binary**: the
+  rating applies to every CVE the advisory names, and Red Hat's OSV data attaches every CVE of an advisory to every
+  binary it ships (RHSA-2026:42828, an httpd:2.4 update, lists the httpd CVEs under mod_http2 too, whose build only
+  moved with the module). So a binary's id list can name CVEs its own code never had: the list is inflated, but the
+  row decision (this binary is below a build Red Hat shipped as a security fix, rated by Red Hat) and the count of
+  findings (per source rpm, not per CVE) are right.
 - **Module streams**: a modular fix (`.module_el9...`, Red Hat's `.module+el9...`) carries the `name:stream` tokens
   of its advisories' summaries (`php:8.1`; `virt:rhel` and `virt-devel:rhel` for a two-module advisory), merged over
   every advisory naming that (binary, fix). The app compares a modular row only with a modular build of the same
   stream (the host's MODULARITYLABEL), a plain row only with a plain build; with no label or no stream it needs the
   same upstream major.minor. So a php:8.2 host never meets a php:8.1 or php:8.3 row.
-- **Module build ids are ignored (review M1).** A modular release is `<n>.module+el8.10.0+<build id>+<context>.<z>`;
-  the build id is the builder's counter, not the package's. Rocky rebuilds Red Hat's httpd:2.4 specs with its own ids:
-  `+1842+4a9649e8.2` .. `+2061+8d03fdec.5` (below Red Hat's `+22196+d82931da.2`), then `+40045+6ce8579b.6` ..
-  `+40402+af9563a3.13` (above Red Hat's `+24521+219dcfc5.9`; rockylinux/rockylinux:8, 2026-11-05). Compared as is,
-  an up-to-date low-id build looks behind forever and a stale high-id one (`.6` against Red Hat's `.9`) is never
-  flagged. Two modular builds therefore compare without `+<build id>+<context>` (`rpmver.match_compare`, meshTerm's
-  `RpmVersion.matchCompare`, shared vectors `tests/fixtures/rpm-module-match.txt`): version, the release up to and
-  including `module+elX.Y.Z`, then the `.z` counter, which the spec carries across rebuilds. Measured: no false
-  positive was live on 2026-11-05 (Rocky's current ids are all above Red Hat's), but the `.6` false negative was.
+- **Module builds (review M1, S6).** A modular release is `<n>.module+el8.10.0+<build id>+<context>.<z>`; the build id
+  is the BUILDER's counter, not the package's. `rpmver.match_compare(a, b, rebuild)` (meshTerm's
+  `RpmVersion.matchCompare`, shared vectors `tests/fixtures/rpm-module-match.txt`) compares two modular builds first
+  WITHOUT `+<build id>+<context>` (version, the release up to and including the dist `module+elX.Y.Z`, Red Hat's
+  z-stream `module+el9.3.0.z` and the layered `module+el8dsrv` / `module+el8pki` too, then the `.z` counter after the
+  context). When that is equal (the same spec built twice), it depends on the host:
+  - **Own vendor** (`rebuild=False`: a RHEL host on `rhel-*`, an AlmaLinux host on `alma-*`): the full EVR decides, ids
+    included, so a REBUILD-ONLY fix is found. Red Hat rebuilt buildah `2:1.33.8-4` with no version or release change
+    (`+22283+6d6d094a`, RHSA-2024:6969, then `+22346+28c02849`, RHSA-2024:8038, Important); skopeo and podman too. On
+    the 2026-11-05 zips such same-spec groups are 240 (binary, fix) groups in rhel-8, 19 in rhel-9, 468 in alma-8 and
+    51 in alma-9 (shipped rows); before S6 every rpm comparison ignored the ids and hid them all. The ids are taken
+    out FIRST so the dist part never misorders content: rpm alone sorts Red Hat's 2019 Judy
+    `1.0.5-18.module+el8+2765+cfa4f87b` above the 8.9 build `+el8.9.0+19449` (2765 against 9) and would flag every RHEL
+    8 host with mariadb:10.3 forever.
+  - **Rebuild host** (`rebuild=True`: a Rocky Linux host on `rhel-*`; the app decides by /etc/os-release ID, the golden
+    cases by their `host`): equal. Rocky rebuilds Red Hat's specs with its own ids: httpd:2.4 `+1842+4a9649e8.2` ..
+    `+2061+8d03fdec.5` (below Red Hat's `+22196+d82931da.2`), then `+40045+6ce8579b.6` .. `+40402+af9563a3.13` (above
+    Red Hat's `+24521+219dcfc5.9`; rockylinux/rockylinux:8, 2026-11-05). Compared with the ids, an up-to-date low-id
+    build looks behind forever and a stale high-id one (`.6` against Red Hat's `.9`) is never flagged. Red Hat's OSV
+    data carries no module version (no `rpmmod` purl qualifier, no CSAF product id; checked on the 2026-11-05 zip), so
+    a Rocky build of the same spec cannot be told from Red Hat's fix or an older build. Counting that tie as affected
+    was measured and refused: the up-to-date Rocky 8 golden then flags nodejs (`+40175+15dc0b4a` IS Rocky's rebuild of
+    RHSA-2026:8339's `+24197+1602b452`) and mod_http2, with nothing to install. **The cost**: a Rocky host is not
+    flagged for a Red Hat rebuild-only fix (buildah above) until Red Hat ships a new version or release.
+  - **Alma's mailman:2.1 (known, bounded).** Alma's records list three builds of mailman 2.1.29-12 on 8.5:
+    `+26+48d4c9ee.2`, `+2601+e8845b76.1` and `+2602+327eb9f3.2` (ALSA-2021:4826 names all three as its fix, ALSA-2021:4916
+    the two `.2` ones). Id 26 is below 2601 though its `.2` is above `.1`, the one inversion of id and content order in
+    alma-8 (plain rpm order would flag a host on `+26` for the `.1` fix). The stripped comparison gets that pair right;
+    against `+2602+327eb9f3.2` the two are the same spec and the ids decide, so a host on `+26+48d4c9ee.2` is flagged for
+    CVE-2021-42096, -42097 and -44227 although ALSA-2021:4916 lists its build as a fix. The data cannot say whether `+26`
+    is a parallel build or an older one (the contexts differ, as they do for buildah's real rebuild); one binary, one
+    stream, on an end-of-life minor's build. Accepted.
 - **No archive, no baseline, no published check** (as Alpine): the repositories' metadata are not fetched. The
   golden images were checked by hand instead: every binary they flag had a candidate at or above the fix in the
   image's own repositories (`dnf repoquery`, 2026-11-05), except Rocky's libcap above (the vendor lag).

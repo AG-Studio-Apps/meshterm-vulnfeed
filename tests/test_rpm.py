@@ -438,14 +438,34 @@ class Golden(unittest.TestCase):
         hits = osvfeed.rpm_hits(rows, inv, "2026-11-05")
         self.assertEqual(hits, {"openssl": ["1:3.5.8-2.el9_8", "1:3.5.8-2.el9_8"],
                                 "php": ["8.2.33-1.module_el9.8.0+303+1bef6c12"]})
-        # M1: a modular row compares without the module build ids. Another builder's build of the host's own release
-        # with a HIGHER id (+400 against the host's +254) is not a fix the host lacks; a higher counter after the
-        # context is, even under a LOWER id.
+        # S6 (review HIGH): against its OWN vendor's file (an Alma host on alma-*, a RHEL host on rhel-*) the plain
+        # order: a rebuild of the host's release with a HIGHER id (+400 against the host's +254) is a fix it lacks
+        # (Red Hat's buildah +22283 -> +22346, RHSA-2024:8038).
         same = [row("php-cli", "8.2.31-1.module_el9.8.0+400+aaaaaaaa", ["php:8.2"])]
-        self.assertEqual(osvfeed.rpm_hits(same, inv, "2026-11-05"), {})
+        self.assertEqual(osvfeed.rpm_hits(same, inv, "2026-11-05"), {"php": ["8.2.31-1.module_el9.8.0+400+aaaaaaaa"]})
+        self.assertEqual(osvfeed.rpm_hits(same, inv, "2026-11-05", rebuild=False),
+                         {"php": ["8.2.31-1.module_el9.8.0+400+aaaaaaaa"]})
+        # M1, a REBUILD host (Rocky on rhel-*): modular rows compare without the module build ids. The other
+        # vendor's build of the same spec is no fix the host lacks; a higher counter after the context is, even
+        # under a LOWER id; a lower id with the same counter is not.
+        self.assertEqual(osvfeed.rpm_hits(same, inv, "2026-11-05", rebuild=True), {})
         newer = [row("php-cli", "8.2.31-1.module_el9.8.0+200+aaaaaaaa.1", ["php:8.2"])]
-        self.assertEqual(osvfeed.rpm_hits(newer, inv, "2026-11-05"),
+        self.assertEqual(osvfeed.rpm_hits(newer, inv, "2026-11-05", rebuild=True),
                          {"php": ["8.2.31-1.module_el9.8.0+200+aaaaaaaa.1"]})
+        lower = [row("php-cli", "8.2.31-1.module_el9.8.0+200+aaaaaaaa", ["php:8.2"])]
+        self.assertEqual(osvfeed.rpm_hits(lower, inv, "2026-11-05", rebuild=False), {})
+        self.assertEqual(osvfeed.rpm_hits(lower, inv, "2026-11-05", rebuild=True), {})
+
+    def test_rebuild_hosts(self):
+        self.assertTrue(osvfeed.rpm_rebuild("rocky", "rhel-8"))
+        self.assertFalse(osvfeed.rpm_rebuild("rhel", "rhel-9"))
+        self.assertFalse(osvfeed.rpm_rebuild("almalinux", "alma-9"))
+        for case in osvfeed.golden_cases():
+            if osvfeed.FORMAT_OF[case["release"]] != "rpm":
+                continue
+            with self.subTest(fixture=case["fixture"]):
+                self.assertIn(case["host"], ("rhel", "almalinux", "rocky"))
+                self.assertEqual(osvfeed.case_rebuild(case), case["fixture"].startswith("rockylinux-"))
 
     def test_real_fixtures(self):
         cases = [c for c in osvfeed.golden_cases() if osvfeed.FORMAT_OF[c["release"]] == "rpm"]
@@ -498,9 +518,9 @@ class EndToEnd(unittest.TestCase):
             handle.write("openssl-libs\t1:3.5.5-2.el9_8\tx86_64\topenssl-3.5.5-2.el9_8.src.rpm\t(none)\n")
         with open(os.path.join(self.golden, "expected.json"), "w") as handle:
             json.dump({"cases": [{"fixture": "inv.rpm.tsv", "release": "alma-9", "capture": "2026-11-05",
-                                  "atLeast": ["openssl"]},
+                                  "atLeast": ["openssl"], "host": "almalinux"},
                                  {"fixture": "inv.rpm.tsv", "release": "rhel-9", "capture": "2026-11-05",
-                                  "exact": ["openssl"]}]}, handle)
+                                  "exact": ["openssl"], "host": "rocky"}]}, handle)
         self.gates = os.path.join(self.tmp, "gates")
         os.makedirs(self.gates)
         with open(os.path.join(self.gates, "minimums.json"), "w") as handle:

@@ -490,6 +490,9 @@ def module_streams(summary):
 # every id the advisory fixes FOR THAT PRODUCT. The zip-wide CVSS of an id is the worst score any Red Hat product's
 # advisory gave it (OpenShift, RHEL 7 ...), not the RHEL rating: on the 2026-11-05 zip it made 416 of 847 RHEL-9
 # Moderate advisories ship as High or Critical, and 18 Important ones as Medium.
+# Id lists (S6 doc, review LOW): the rating covers every CVE the advisory names, and Red Hat's OSV data attaches every
+# CVE of an advisory to every binary it ships (RHSA-2026:42828, httpd:2.4, lists the httpd CVEs under mod_http2), so a
+# binary's ids can be inflated; the row decision and the per-source-rpm finding count are still right (README).
 _RH_RATING = re.compile(r"(?:access|www)\.redhat\.com/security/updates/classification/?#(critical|important|moderate|low)"
                         r"(?![a-z])", re.IGNORECASE)
 
@@ -1424,10 +1427,27 @@ def rpm_stream_ok(fixed, streams, installed, label):
     return mm is not None and mm == rpmver.upstream_major_minor(installed)
 
 
-def rpm_hits(rows, inventory, capture):
+# The /etc/os-release ID of the vendor whose own builds each EL release file carries (S6, review HIGH).
+EL_FILE_VENDOR = {"rhel": "rhel", "alma": "almalinux"}
+
+
+def rpm_rebuild(host_id, key):
+    """Whether a host with /etc/os-release ID `host_id` is a REBUILD host for EL release file `key`: one matched
+    against another vendor's builds (Rocky Linux, `rocky`, against rhel-*). A RHEL host (`rhel`) against rhel-* and an
+    AlmaLinux host (`almalinux`) against alma-* are not: their files carry their own vendor's module build ids, so
+    rpmver.match_compare compares them plainly."""
+    return host_id != EL_FILE_VENDOR[key.split("-", 1)[0]]
+
+
+def case_rebuild(case):
+    """rpm_rebuild for an EL golden case (its `host`: the fixture's /etc/os-release ID)."""
+    return rpm_rebuild(case["host"], case["release"])
+
+
+def rpm_hits(rows, inventory, capture, rebuild=False):
     """{source rpm: [fixed, ...]} for the non-kernel rows published before `capture` that an installed binary is
     affected by (introduced <= installed < fixed, the stream rule), grouped by the binary's source rpm as the app
-    groups its findings."""
+    groups its findings. `rebuild` (rpm_rebuild) selects rpmver.match_compare's rebuild mode."""
     hits = collections.defaultdict(list)
     for row in rows:
         if row["kernel"] or not published_before(row, capture):
@@ -1438,10 +1458,11 @@ def rpm_hits(rows, inventory, capture):
         installed, group, label = entry
         if not rpm_stream_ok(row["fixed"], row.get("streams") or [], installed, label):
             continue
-        # Review M1: modular builds compare without their module build ids (Rocky's own), as the app does.
-        if row["introduced"] != "0" and rpmver.match_compare(installed, row["introduced"]) < 0:
+        # S6 (review HIGH): plain EVR order for a host against its own vendor's file; a rebuild host (Rocky against
+        # rhel-*) compares modular builds without their module build ids (review M1), as the app does.
+        if row["introduced"] != "0" and rpmver.match_compare(installed, row["introduced"], rebuild) < 0:
             continue
-        if rpmver.match_compare(installed, row["fixed"]) < 0:
+        if rpmver.match_compare(installed, row["fixed"], rebuild) < 0:
             hits[group].append(row["fixed"])
     return dict(hits)
 
@@ -1571,7 +1592,7 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
             hits, unarchived = apk_hits(release_body(Release(key, "alpine", None, None), rows), inventory), []
         elif fmt == "rpm":
             # Advisory dates, no archive: the rows published before capture, matched as the app does.
-            hits, unarchived = rpm_hits(rows, inventory, case["capture"]), []
+            hits, unarchived = rpm_hits(rows, inventory, case["capture"], case_rebuild(case)), []
         else:
             at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
             hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)

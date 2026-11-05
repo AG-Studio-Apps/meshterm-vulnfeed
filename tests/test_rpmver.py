@@ -100,20 +100,43 @@ class ModuleBuildTail(unittest.TestCase):
         self.assertEqual(strip("2.4.37"), "2.4.37", "no release")
         self.assertEqual(strip("not an evr-a-b"), "not an evr-a-b")
         self.assertEqual(strip("1-1.module+el8+1+abc"), "1-1.module+el8", "a major-only dist")
+        # S6: Red Hat's z-stream dist and the layered products' dists (before S6 these kept their tails).
+        self.assertEqual(strip("1:1.22.1-5.module+el9.3.0.z+20438+032561a0"), "1:1.22.1-5.module+el9.3.0.z")
+        self.assertEqual(strip("0:1.4.3.31-6.module+el8dsrv+16980+c4b9cd33"), "0:1.4.3.31-6.module+el8dsrv")
+        self.assertEqual(strip("0:4.9.8-1.module+el8pki+19895+c800dfbd"), "0:4.9.8-1.module+el8pki")
+        self.assertEqual(strip("1-1.module+el8.0.0.z+1+abc.2"), "1-1.module+el8.0.0.z.2")
+        self.assertEqual(strip("1-1.module+el8.10.0+x+abc"), "1-1.module+el8.10.0+x+abc", "the id must be digits")
+
+    def test_match_compare_modes(self):
+        old, new = "2:1.33.8-4.module+el8.10.0+22283+6d6d094a", "2:1.33.8-4.module+el8.10.0+22346+28c02849"
+        self.assertEqual(rpmver.match_compare(old, new), -1, "own vendor by default: RHEL and Alma hosts")
+        self.assertEqual(rpmver.match_compare(old, new, rebuild=False), -1)
+        self.assertEqual(rpmver.match_compare(old, new, rebuild=True), 0, "a Rocky host: the same spec")
+        # The tails come out first in both modes: plain rpm order puts el8+2765 above el8.9.0+19449.
+        judy_89, judy_80 = "0:1.0.5-18.module+el8.9.0+19449+ad5852d3", "0:1.0.5-18.module+el8+2765+cfa4f87b"
+        self.assertEqual(rpmver.compare(judy_89, judy_80), -1)
+        self.assertEqual(rpmver.match_compare(judy_89, judy_80), 1)
+        self.assertEqual(rpmver.match_compare(judy_89, judy_80, rebuild=True), 1)
 
     def test_shared_vectors(self):
         got = module_cases()
-        self.assertEqual(len(got), 15)
-        for a, b, want in got:
-            with self.subTest(a=a, b=b):
-                self.assertEqual(rpmver.match_compare(a, b), int(want))
-                self.assertEqual(rpmver.match_compare(b, a), -int(want))
+        self.assertEqual(len(got), 32)
+        self.assertEqual({len(case) for case in got}, {4})
+        self.assertEqual({case[0] for case in got}, {"own", "rebuild"})
+        for mode, a, b, want in got:
+            with self.subTest(mode=mode, a=a, b=b):
+                rebuild = mode == "rebuild"
+                self.assertTrue(rpmver.validate(a) and rpmver.validate(b))
+                self.assertEqual(rpmver.match_compare(a, b, rebuild), int(want))
+                self.assertEqual(rpmver.match_compare(b, a, rebuild), -int(want))
+                if not (rpmver.is_modular(a) and rpmver.is_modular(b)):
+                    self.assertEqual(rpmver.compare(a, b), int(want), "not both modular: the plain order")
         with open(MODULE_MATCH, "rb") as handle:
             self.assertEqual(hashlib.sha256(handle.read()).hexdigest(), MODULE_MATCH_SHA256,
                              "the shared copy drifted (change meshTerm's in the same breath)")
 
 
-MODULE_MATCH_SHA256 = "5b74d12ab656268b3c4ce028feedfce19ca5d3f8b355df30cddbcc2a40d76fb7"
+MODULE_MATCH_SHA256 = "dbfeae7138e60de211da160761ab74c8f55b8d72d15834ee8154633634721450"
 
 
 if __name__ == "__main__":

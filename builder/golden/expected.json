@@ -20,7 +20,8 @@
   "zlib (1.3.2-r0 < 1.3.2-r1, CVE-2026-85091).",
   "EL (rpm, S5) cases: the fixture is the app's Pro probe rpm listing (NAME, EPOCHNUM:VERSION-RELEASE, ARCH, SOURCERPM,",
   "MODULARITYLABEL) from a stock image as uid 1000, matched against the shipped rows exactly as the app does (per binary",
-  "the highest EVR; the module-stream rule; modular builds compared without their module build ids; findings grouped by",
+  "the highest EVR; the module-stream rule; modular builds compared by rpmver.match_compare in the case's `host` mode",
+  "(`host` is the image's /etc/os-release ID: `rocky` against rhel-* is a rebuild host, S6); findings grouped by",
   "source rpm; kernel rows not counted), counting rows whose advisory is dated before `capture`. Red Hat's `published`",
   "is often the date its records were converted to OSV, not the advisory's (RHSA-2003:315 says 2024-09-12), so `capture`",
   "is always the capture day itself, never a backdated one. almalinux:9 (9.8, sha256:245f8aab832f...) flags nothing on",
@@ -33,7 +34,7 @@
   "ships it; every other flagged binary had an upgrade at or above the fix in the image's own repositories",
   "(`dnf repoquery`, 2026-11-05). rockylinux/rockylinux:8 (8.10, sha256:e8a49c5403b6..., upgraded in the container, then",
   "httpd:2.4 and nodejs:20 installed from Rocky's repositories) flags nothing on rhel-8: Rocky's module builds carry its",
-  "own build ids (+40402+af9563a3.13 against Red Hat's +24521+219dcfc5.9), which the matcher ignores (review M1). The",
+  "own build ids (+40402+af9563a3.13 against Red Hat's +24521+219dcfc5.9), which a rebuild host's matcher ignores (review M1). The",
   "same image with httpd pinned at Rocky's +40045+6ce8579b.6 flags exactly httpd: without the rule its id 40045 sorted",
   "above Red Hat's .7 to .9 fixes and hid them. The two synthetic php:8.2 listings (no image) prove the stream rule:",
   "php:8.3 rows (8.3.36 > 8.2.33) and php:8.1 rows never match a php:8.2 module host."
@@ -107,7 +108,8 @@
    "fixture": "almalinux-9-stock.rpm.tsv",
    "release": "alma-9",
    "capture": "2026-11-05",
-   "exact": []
+   "exact": [],
+   "host": "almalinux"
   },
   {
    "fixture": "almalinux-9.2-20230718.rpm.tsv",
@@ -136,7 +138,8 @@
     "python3.9",
     "sqlite",
     "vim"
-   ]
+   ],
+   "host": "almalinux"
   },
   {
    "fixture": "rockylinux-9.3-20231128.rpm.tsv",
@@ -165,7 +168,8 @@
     "python3.9",
     "sqlite",
     "vim"
-   ]
+   ],
+   "host": "rocky"
   },
   {
    "fixture": "rockylinux-9-resf-stock.rpm.tsv",
@@ -184,13 +188,15 @@
     "pcre2",
     "python3.9",
     "sqlite"
-   ]
+   ],
+   "host": "rocky"
   },
   {
    "fixture": "synthetic-alma-9-php82-module-current.rpm.tsv",
    "release": "alma-9",
    "capture": "2026-11-05",
-   "exact": []
+   "exact": [],
+   "host": "almalinux"
   },
   {
    "fixture": "synthetic-alma-9-php82-module-behind.rpm.tsv",
@@ -198,13 +204,15 @@
    "capture": "2026-11-05",
    "exact": [
     "php"
-   ]
+   ],
+   "host": "almalinux"
   },
   {
    "fixture": "rockylinux-8-modules-current.rpm.tsv",
    "release": "rhel-8",
    "capture": "2026-11-05",
-   "exact": []
+   "exact": [],
+   "host": "rocky"
   },
   {
    "fixture": "rockylinux-8-httpd-behind.rpm.tsv",
@@ -212,7 +220,8 @@
    "capture": "2026-11-05",
    "exact": [
     "httpd"
-   ]
+   ],
+   "host": "rocky"
   }
  ]
 }

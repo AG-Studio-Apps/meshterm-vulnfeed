@@ -1,28 +1,62 @@
-# meshterm-vulnfeed rpmver.match_compare / meshTerm RpmVersion.matchCompare (review M1): the comparison the matcher
-# uses. Two MODULAR builds compare without the `+<module build id>+<context>` after `module[_+]elX.Y.Z`; anything else
-# is the plain EVR order. Real NEVRAs (Red Hat's rhel-8 httpd:2.4 fixes, Rocky's rockylinux/rockylinux:8 repository on
-# 2026-11-05, Alma's php:8.1) except the made-up contexts 0a1b2c3d and aaaaaaaa. Shared byte for byte with meshTerm's copy. Format: a<TAB>b<TAB>expected (-1, 0, 1).
+# meshterm-vulnfeed rpmver.match_compare(a, b, rebuild) / meshTerm RpmVersion.matchCompare (review M1, S6): the
+# comparison the matcher uses. Shared byte for byte with meshTerm's copy.
+# Format: mode<TAB>a<TAB>b<TAB>expected (-1, 0, 1). Every line also holds with a and b swapped and expected negated.
+# Two MODULAR builds first compare without the `+<module build id>+<context>` that follows `module[_+]el<major>` and
+# any letters, digits and dots (el8.10.0, el9.3.0.z, el8dsrv); when that is equal (the same spec built twice):
+# mode `own` (a host against its own vendor's file: RHEL against rhel-*, AlmaLinux against alma-*): the full EVR
+#   order decides, module build ids included (a rebuild-only fix is a fix).
+# mode `rebuild` (a rebuild host against another vendor's file: Rocky Linux against rhel-*): 0 (the other vendor's
+#   ids say nothing, and the feed has no module version to tell a rebuild of the fix from an older build).
+# Anything not both modular is the plain EVR order in either mode.
+# Real NEVRAs (Red Hat's rhel-8 httpd:2.4, container-tools:rhel8, mariadb:10.3 and nginx fixes, Rocky's
+# rockylinux/rockylinux:8 repository on 2026-11-05, Alma's php:8.1 and mailman:2.1) except the made-up contexts
+# 0a1b2c3d and aaaaaaaa and the ids 90001.
+# Red Hat's buildah, rebuilt with no version or release change and fixed again by RHSA-2024:8038 (Important): a RHEL
+# host on the older build IS behind.
+own	2:1.33.8-4.module+el8.10.0+22283+6d6d094a	2:1.33.8-4.module+el8.10.0+22346+28c02849	-1
+own	0:2.4.37-65.module+el8.10.0+24281+ea10630c.8	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	-1
+own	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	0
+# Alma's own ids decide too: a host on the older php:8.1 build is behind the rebuild.
+own	8.1.32-1.module_el9.8.0+300+aaaaaaaa.alma.1	8.1.32-1.module_el9.8.0+326+528679fc.alma.1	-1
+own	8.1.32-1.module_el9.8.0+326+528679fc.alma.1	8.1.32-1.module_el9.8.0+326+528679fc	1
+# The content before the ids: rpm alone sorts Red Hat's 2019 Judy (el8+2765) above its 8.9 build (2765 > 9), and Alma's
+# mailman +26 (.2) below +2601 (.1).
+own	0:1.0.5-18.module+el8.9.0+19449+ad5852d3	0:1.0.5-18.module+el8+2765+cfa4f87b	1
+own	3:2.1.29-12.module_el8.5.0+26+48d4c9ee.2	3:2.1.29-12.module_el8.5.0+2601+e8845b76.1	1
+own	3:2.1.29-12.module_el8.5.0+26+48d4c9ee.2	3:2.1.29-12.module_el8.5.0+2602+327eb9f3.2	-1
+own	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	-1
+# Rebuild mode, Rocky against Red Hat. The same buildah spec built twice: equal (not affected).
+rebuild	2:1.33.8-4.module+el8.10.0+22283+6d6d094a	2:1.33.8-4.module+el8.10.0+22346+28c02849	0
+rebuild	3:2.1.29-12.module_el8.5.0+26+48d4c9ee.2	3:2.1.29-12.module_el8.5.0+2602+327eb9f3.2	0
+# Rocky's nodejs:20 is its rebuild of Red Hat's RHSA-2026:8339 fix: equal, not behind.
+rebuild	1:20.20.2-1.module+el8.10.0+40175+15dc0b4a	1:20.20.2-1.module+el8.10.0+24197+1602b452	0
 # Rocky's current build (id 40402) is not behind Red Hat's latest .9 fix: .13 > .9.
-0:2.4.37-65.module+el8.10.0+40402+af9563a3.13	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	1
+rebuild	0:2.4.37-65.module+el8.10.0+40402+af9563a3.13	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	1
 # Rocky's earlier .6 IS behind Red Hat's .9, though its id 40045 sorts above 24521.
-0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	-1
+rebuild	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.module+el8.10.0+24521+219dcfc5.9	-1
 # Rocky's .5 (id 2061) carries Red Hat's .2 fix (id 22196): not behind it.
-2.4.37-65.module+el8.10.0+2061+8d03fdec.5	0:2.4.37-65.module+el8.10.0+22196+d82931da.2	1
+rebuild	2.4.37-65.module+el8.10.0+2061+8d03fdec.5	0:2.4.37-65.module+el8.10.0+22196+d82931da.2	1
 # A rebuild with the same z-stream counter is the same fix.
-0:2.4.37-65.module+el8.10.0+40206+be2c8a50.8	0:2.4.37-65.module+el8.10.0+24281+ea10630c.8	0
-0:1.15.7-10.module+el8.10.0+40257+286895ef.7	0:1.15.7-10.module+el8.10.0+24521+219dcfc5.7	0
+rebuild	0:2.4.37-65.module+el8.10.0+40206+be2c8a50.8	0:2.4.37-65.module+el8.10.0+24281+ea10630c.8	0
+rebuild	0:1.15.7-10.module+el8.10.0+40257+286895ef.7	0:1.15.7-10.module+el8.10.0+24521+219dcfc5.7	0
 # The release, then the minor release, still order before the counter: 8.10.0 is above 8.9.0 whatever follows.
-0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-51.module+el8.6.0+18934+12ac9b89.11	1
-0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.module+el8.9.0+20000+0a1b2c3d.11	1
-0:2.4.37-56.module+el8.8.0+1456+46b1e3e3.2	0:2.4.37-65.module+el8.10.0+22196+d82931da.2	-1
+rebuild	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-51.module+el8.6.0+18934+12ac9b89.11	1
+rebuild	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.module+el8.9.0+20000+0a1b2c3d.11	1
+rebuild	0:2.4.37-56.module+el8.8.0+1456+46b1e3e3.2	0:2.4.37-65.module+el8.10.0+22196+d82931da.2	-1
+# Red Hat's z-stream dist (el9.3.0.z) and a layered product's (el8dsrv) lose their tails too.
+rebuild	1:1.22.1-5.module+el9.3.0.z+20438+032561a0	1:1.22.1-5.module+el9.3.0.z+90001+0a1b2c3d	0
+rebuild	1:1.22.1-5.module+el9.3.0.z+20438+032561a0	1:1.22.1-4.module+el9.3.0.z+90001+0a1b2c3d	1
+rebuild	0:1.4.3.31-6.module+el8dsrv+16980+c4b9cd33	0:1.4.3.31-6.module+el8dsrv+90001+0a1b2c3d	0
 # Version and epoch first, as always.
-1:20.20.2-1.module+el8.10.0+40175+15dc0b4a	1:20.19.5-1.module+el8.10.0+23800+0a1b2c3d	1
-1:10.8.2-1.20.20.2.1.module+el8.10.0+40175+15dc0b4a	0:10.8.2-1.20.20.2.1.module+el8.10.0+23800+0a1b2c3d	1
-# Alma's build tail and its .alma suffix.
-8.1.32-1.module_el9.8.0+326+528679fc.alma.1	8.1.32-1.module_el9.8.0+300+aaaaaaaa.alma.1	0
-8.1.32-1.module_el9.8.0+326+528679fc.alma.1	8.1.32-1.module_el9.8.0+326+528679fc	1
-# Not both modular: the plain order (the stream rule never compares them anyway).
-0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.el8	1
-1:3.5.8-2.el9_8	1:3.5.5-2.el9_8	1
-# No release on one side: versions only.
-2.4.37	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0
+rebuild	1:20.20.2-1.module+el8.10.0+40175+15dc0b4a	1:20.19.5-1.module+el8.10.0+23800+0a1b2c3d	1
+rebuild	1:10.8.2-1.20.20.2.1.module+el8.10.0+40175+15dc0b4a	0:10.8.2-1.20.20.2.1.module+el8.10.0+23800+0a1b2c3d	1
+# Alma's build tail and its .alma suffix (rebuild mode is never used for Alma; the stripping still works).
+rebuild	8.1.32-1.module_el9.8.0+326+528679fc.alma.1	8.1.32-1.module_el9.8.0+300+aaaaaaaa.alma.1	0
+rebuild	8.1.32-1.module_el9.8.0+326+528679fc.alma.1	8.1.32-1.module_el9.8.0+326+528679fc	1
+# Not both modular: the plain order in either mode (the stream rule never compares them anyway).
+rebuild	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0:2.4.37-65.el8	1
+rebuild	1:3.5.8-2.el9_8	1:3.5.5-2.el9_8	1
+own	1:3.5.8-2.el9_8	1:3.5.5-2.el9_8	1
+# No release on one side: versions only, in either mode.
+rebuild	2.4.37	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0
+own	2.4.37	0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6	0

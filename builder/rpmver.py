@@ -139,13 +139,18 @@ def is_modular(text):
 # then `+<module build id>+<context>`. The id is the BUILDER's counter, not the package's: Red Hat's httpd:2.4 on 8.10
 # is `+22196+d82931da.2` .. `+24521+219dcfc5.9`, Rocky's rebuilds of the same specs `+1842+4a9649e8.2` ..
 # `+2061+8d03fdec.5`, then `+40045+6ce8579b.6` .. `+40402+af9563a3.13` (rockylinux/rockylinux:8, 2026-11-05). The z-stream
-# counter after the context (`.9`) is the spec's own and matches across rebuilds.
-_MODULE_BUILD_TAIL = re.compile(r"(module[_+]el\d+(?:\.\d+)*)\+\d+\+[A-Za-z0-9]+")
+# counter after the context (`.9`) is the spec's own and matches across rebuilds. The dist part may end in Red Hat's
+# z-stream marker (`module+el9.3.0.z+20438+032561a0`, 637 fixed events on 2026-11-05) or a layered product's tag
+# (`module+el8dsrv+16980+c4b9cd33`, `module+el8pki+19895+c800dfbd`): letters, digits and dots after `el<major>`,
+# up to the first `+`, which must start `+<digits>+<context>`. (Before S6 the dist part was `elX(.Y)*` only, so these
+# 1,232 Red Hat fixed events kept their tails; it matters only for rebuild hosts.)
+_MODULE_BUILD_TAIL = re.compile(r"(module[_+]el\d+[A-Za-z0-9.]*)\+\d+\+[A-Za-z0-9]+")
 
 
 def without_module_build(text):
     """`2.4.37-65.module+el8.10.0+40045+6ce8579b.6` -> `2.4.37-65.module+el8.10.0.6`: the EVR with the first
-    `+<build id>+<context>` after `module[_+]elX.Y.Z` taken out of the release; any other EVR unchanged."""
+    `+<build id>+<context>` after `module[_+]elX.Y.Z` (or `elX.Y.Z.z`, `elXdsrv` ...) taken out of the release; any
+    other EVR unchanged."""
     parsed = parse(text)
     if parsed is None or parsed[2] is None:
         return text
@@ -153,13 +158,31 @@ def without_module_build(text):
     return head + _MODULE_BUILD_TAIL.sub(r"\1", parsed[2], count=1)
 
 
-def match_compare(a, b):
-    """The comparison the matcher uses (meshTerm's RpmVersion.matchCompare is the twin): `compare`, except that two
-    MODULAR builds compare without their module build tails (`without_module_build`), so a rebuild's own build ids
-    (Rocky's +40045 against Red Hat's +24521) never decide the order: version, then the release up to and including
-    `module+elX.Y.Z`, then what follows the context."""
-    if is_modular(a) and is_modular(b):
-        return compare(without_module_build(a), without_module_build(b))
+def match_compare(a, b, rebuild=False):
+    """The comparison the matcher uses (meshTerm's RpmVersion.matchCompare is the twin): -1, 0 or 1. Not both MODULAR:
+    plain `compare`. Both modular: first `compare` of the two without their module build tails
+    (`without_module_build`: version, the release up to and including `module+elX.Y.Z`, then what follows the
+    context); when that is not 0, it is the answer. When it is 0 (two builds of the same spec):
+
+    rebuild=False (a host against its OWN vendor's file: RHEL against rhel-*, AlmaLinux against alma-*, whose module
+    build ids are the host vendor's own): the full `compare`, so the build ids decide and a rebuild-only fix is found
+    (Red Hat's buildah 2:1.33.8-4.module+el8.10.0+22283+6d6d094a is fixed again by RHSA-2024:8038, Important, at
+    +22346+28c02849, the same version and release). The tails are taken out FIRST so that rpm's order of the dist part
+    never decides against the content: rpm sorts Red Hat's 2019 Judy `1.0.5-18.module+el8+2765+cfa4f87b` above
+    `1.0.5-18.module+el8.9.0+19449+ad5852d3` (2765 against 9), which with plain `compare` flagged every RHEL 8 host
+    with mariadb:10.3 forever, and Alma's mailman `+26+48d4c9ee.2` below `+2601+e8845b76.1`.
+
+    rebuild=True (a REBUILD host against another vendor's file: Rocky Linux against rhel-*): 0. The rebuilder's ids
+    (Rocky's +40045 against Red Hat's +24521) say nothing about Red Hat's, and Red Hat's OSV data carries no module
+    version to tell Rocky's rebuild of a fix from its older build; an up-to-date Rocky host is always in that state
+    (its nodejs 1:20.20.2-1.module+el8.10.0+40175+15dc0b4a IS Red Hat's fix +24197+1602b452), so counting the tie as
+    affected would flag it with no update to install. The cost is a Rocky host missing a Red Hat rebuild-only fix
+    (README)."""
+    if not (is_modular(a) and is_modular(b)):
+        return compare(a, b)
+    rc = compare(without_module_build(a), without_module_build(b))
+    if rc or rebuild:
+        return rc
     return compare(a, b)
 
 
