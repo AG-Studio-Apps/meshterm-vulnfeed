@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the vulnfeed freshness watch twice daily
+
+[Timer]
+# `06,18:40:00` = 06:40 and 18:40 UTC, 90 minutes after the 05:10 / 17:10 builds (NOT `06:40,18:40`,
+# which parses as hour 06, minutes {40,18}). Clear of relay-health (06/18:10) and agent-compat (05/17:30).
+OnCalendar=*-*-* 06,18:40:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

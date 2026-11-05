@@ -1,0 +1,12 @@
+[Unit]
+Description=vulnfeed freshness watch (live manifest age and signature)
+
+[Service]
+Type=oneshot
+# Runs the INSTALLED copy (alert/install.sh), never the working tree.
+ExecStart=%h/.local/lib/vulnfeed-freshness/run.sh
+TimeoutStartSec=300
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+# Dry run unless ~/.config/vulnfeed-freshness.env says VULNFEED_ALERT_DRY_RUN=0 (kept OUTSIDE the repo).
+Environment=VULNFEED_ALERT_DRY_RUN=1
+EnvironmentFile=-%h/.config/vulnfeed-freshness.env
