@@ -265,5 +265,104 @@ class SignJobFormats(unittest.TestCase):
         self.assertIn("says format 'dpkg', the manifest 'apk'", result.stdout)
 
 
+def rpm_releases():
+    """ReleaseOptions whose S2 step writes one small, valid (compact) alma-9 file and nothing else."""
+    from feedlib import content_name, sha256_hex
+    release = next(r for r in osvfeed.RELEASES if r.key == "alma-9")
+
+    def builder(site_v1, log, previous, today):
+        rows = [{"source": "openssl-libs", "introduced": "0", "fixed": "1:3.5.8-2.el9_8", "severity": 3,
+                 "ids": ["CVE-2026-10001"], "kernel": False, "date": "2026-10-01", "streams": []},
+                {"source": "kernel-core", "introduced": "0", "fixed": "5.14.0-611.5.1.el9_8", "severity": 4,
+                 "ids": ["CVE-2026-10002"], "kernel": True, "date": "2026-10-01"}]
+        data = osvfeed.body_bytes(osvfeed.release_body(release, rows))
+        name = "r/" + content_name("alma-9", data)
+        os.makedirs(os.path.join(site_v1, "r"), exist_ok=True)
+        with open(os.path.join(site_v1, name), "wb") as handle:
+            handle.write(data)
+        return ({"alma-9": {"format": "rpm", "file": name, "sha256": sha256_hex(data), "bytes": len(data),
+                            "rows": 2}},
+                {"osv": {"AlmaLinux": "2026-11-05T09:30:02Z"}, "archive": {}, "baseline": {}}, {})
+    return build.ReleaseOptions(builder=builder)
+
+
+class SignJobRpm(SignJobFormats):
+    """S5: an rpm body carries `ids` and `fixes` too; alma-* / rhel-* entries must be rpm; an all-EL feed may have an
+    empty archive."""
+
+    def setUp(self):
+        self.repo = helpers.scratch_repo()
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.out = os.path.join(self.repo, "out")
+        self.manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                                       options=rpm_releases())
+        self.script = os.path.join(self.repo, "signcheck.py")
+        with open(self.script, "w") as handle:
+            handle.write(sign_check_script())
+
+    def test_all_alpine_feed_with_an_empty_archive_passes(self):
+        self.assertEqual(self.manifest["sources"]["archive"], {})
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("1 release file(s) match the manifest", result.stdout)
+
+    def test_empty_archive_refused_with_a_dpkg_release(self):
+        def add_dpkg(manifest):
+            manifest["releases"]["debian-12"] = dict(manifest["releases"]["alma-9"], format="dpkg")
+        self.edit_manifest(add_dpkg)
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sources.archive is not {suite: UTC time}", result.stdout)
+
+    def test_alpine_entry_must_be_apk(self):
+        self.edit_manifest(lambda m: m["releases"]["alma-9"].update(format="dpkg"))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release alma-9: bad entry", result.stdout)
+
+    def test_body_format_must_equal_the_entry(self):
+        import hashlib
+        entry = self.manifest["releases"]["alma-9"]
+        path = os.path.join(self.out, "v1", entry["file"])
+        with open(path, "rb") as handle:
+            body = json.loads(handle.read())
+        os.remove(path)
+        body["format"] = "apk"
+        data = osvfeed.body_bytes(body)
+        sha = hashlib.sha256(data).hexdigest()
+        name = f"r/alma-9-{sha[:16]}.json"
+        with open(os.path.join(self.out, "v1", name), "wb") as handle:
+            handle.write(data)
+        self.edit_manifest(lambda m: m["releases"]["alma-9"].update(file=name, sha256=sha, bytes=len(data)))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("says format 'apk', the manifest 'rpm'", result.stdout)
+
+    def test_rpm_body_without_its_tables_refused(self):
+        import hashlib
+        entry = self.manifest["releases"]["alma-9"]
+        path = os.path.join(self.out, "v1", entry["file"])
+        with open(path, "rb") as handle:
+            body = json.loads(handle.read())
+        os.remove(path)
+        del body["fixes"]
+        data = osvfeed.body_bytes(body)
+        sha = hashlib.sha256(data).hexdigest()
+        name = f"r/alma-9-{sha[:16]}.json"
+        with open(os.path.join(self.out, "v1", name), "wb") as handle:
+            handle.write(data)
+        self.edit_manifest(lambda m: m["releases"]["alma-9"].update(file=name, sha256=sha, bytes=len(data)))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not name its release", result.stdout)
+
+    def test_rhel_keys_are_rpm(self):
+        text = sign_check_script()
+        namespace = {}
+        exec(text[text.index("def fmt_of"):text.index("iso = re.compile")].replace("          ", ""), namespace)
+        self.assertEqual([namespace["fmt_of"](k) for k in ("alma-8", "rhel-10", "alpine-3.20", "debian-12")],
+                         ["rpm", "rpm", "apk", "dpkg"])
+
+
 if __name__ == "__main__":
     unittest.main()

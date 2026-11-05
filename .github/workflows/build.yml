@@ -287,7 +287,11 @@ jobs:
           allow = {"ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                    "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
                    "debian-11", "debian-12", "debian-13",
-                   "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24"}
+                   "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24",
+                   "alma-8", "alma-9", "alma-10", "rhel-8", "rhel-9", "rhel-10"}
+          # The format each release key must carry (S4 apk, S5 rpm; everything else dpkg).
+          def fmt_of(key):
+              return "apk" if key.startswith("alpine-") else "rpm" if key.startswith(("alma-", "rhel-")) else "dpkg"
           # Releases dropped from the feed (builder/osvfeed.py RETIRED_RELEASES): never a manifest entry, their
           # old files allowed only as carry-overs (checked against builds/ below) until they age out.
           retired = set()
@@ -303,7 +307,7 @@ jobs:
               if not isinstance(e, dict) or set(e) != {"format", "file", "sha256", "bytes", "rows"}:
                   problems.append(f"release {key}: bad entry keys"); continue
               sha, name = e["sha256"], e["file"]
-              if e["format"] != ("apk" if key.startswith("alpine-") else "dpkg") or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
+              if e["format"] != fmt_of(key) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
                       or name != f"r/{key}-{sha[:16]}.json" \
                       or type(e["bytes"]) is not int or not 0 < e["bytes"] <= 600 * 1024 \
                       or type(e["rows"]) is not int or e["rows"] < 0:
@@ -318,8 +322,9 @@ jobs:
                   body = json.loads(data, object_pairs_hook=pairs)
               except ValueError:
                   problems.append(f"release {key}: {name} is not JSON"); continue
-              if not isinstance(body, dict) or body.get("release") != key \
-                      or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
+              # An rpm body (S5) also carries its shared `ids` and `fixes` tables; its pkgs map binaries to fix indexes.
+              keys = {"release", "format", "keyedBy", "pkgs", "kernel"} | ({"ids", "fixes"} if fmt_of(key) == "rpm" else set())
+              if not isinstance(body, dict) or body.get("release") != key or set(body) != keys:
                   problems.append(f"release {key}: {name} does not name its release"); continue
               if body.get("format") != e["format"]:
                   problems.append(f"release {key}: {name} says format {body.get('format')!r}, the manifest {e['format']!r}"); continue
@@ -337,11 +342,11 @@ jobs:
               problems.append("sources keys are not exactly osv, archive, baseline")
           else:
               osv, arc, base = src["osv"], src["archive"], src["baseline"]
-              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu", "Alpine"} \
+              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat"} \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in osv.values()):
-                  problems.append("sources.osv is not {Debian|Ubuntu|Alpine: UTC time}")
-              # Alpine releases have no archive: it may be empty only when every release is an Alpine one.
-              dpkg = any(not k.startswith("alpine-") for k in rels)
+                  problems.append("sources.osv is not {Debian|Ubuntu|Alpine|AlmaLinux|Red Hat: UTC time}")
+              # Alpine and EL releases have no archive: it may be empty only when no release is a dpkg one.
+              dpkg = any(fmt_of(k) == "dpkg" for k in rels)
               if not isinstance(arc, dict) or (dpkg and not arc) or len(arc) > 64 \
                       or not all(isinstance(k, str) and re.fullmatch(r"[a-z]+(-updates|-security)?", k) for k in arc) \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in arc.values()):

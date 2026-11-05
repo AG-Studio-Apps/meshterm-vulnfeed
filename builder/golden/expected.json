@@ -17,7 +17,17 @@
   "(3.20.10, sha256:d9e853e87e55...) flags nothing and is `exact: []`: 3.20 is end of life, so it is the Alpine",
   "false-positive gate (an unexpected origin warns, 3 or more fail). alpine:3.20.0",
   "(sha256:77726ef6b57d..., May 2024) flags musl, openssl, zlib; alpine:latest (3.24.2, sha256:294b683cb724...) flags",
-  "zlib (1.3.2-r0 < 1.3.2-r1, CVE-2026-85091)."
+  "zlib (1.3.2-r0 < 1.3.2-r1, CVE-2026-85091).",
+  "EL (rpm, S5) cases: the fixture is the app's Pro probe rpm listing (NAME, EPOCHNUM:VERSION-RELEASE, ARCH, SOURCERPM,",
+  "MODULARITYLABEL) from a stock image as uid 1000, matched against the shipped rows exactly as the app does (per binary",
+  "the highest EVR; the module-stream rule; findings grouped by source rpm; kernel rows not counted), counting rows whose",
+  "advisory is dated before `capture` (EL advisories carry their date). almalinux:9 (9.8, sha256:245f8aab832f...)",
+  "flags nothing on alma-9 (the EL false-positive gate). almalinux:9.2 (sha256:09fdb3db0975..., July 2023) and",
+  "rockylinux:9 (the Docker library image, 9.3, sha256:d7be1c094cc5..., November 2023; against the RHEL data, as the",
+  "app matches Rocky) flag their known sets; every flagged binary had an upgrade at or above the fix in the image's own",
+  "rockylinux/rockylinux:9 (RESF's image, 9.8, sha256:8101994123cf...) is behind RHEL by months and flags its set too.",
+  "repositories (`dnf repoquery` in the image, 2026-11-05). The two synthetic php:8.2 listings (no image) prove the",
+  "stream rule: php:8.3 rows (8.3.36 > 8.2.33) and php:8.1 rows never match a php:8.2 module host."
  ],
  "cases": [
   {
@@ -82,6 +92,114 @@
    "capture": "2026-11-05",
    "atLeast": [
     "zlib"
+   ]
+  },
+  {
+   "fixture": "almalinux-9-stock.rpm.tsv",
+   "release": "alma-9",
+   "capture": "2026-11-05",
+   "exact": []
+  },
+  {
+   "fixture": "almalinux-9.2-20230718.rpm.tsv",
+   "release": "alma-9",
+   "capture": "2026-11-05",
+   "atLeast": [
+    "acl",
+    "ca-certificates",
+    "curl",
+    "expat",
+    "glib2",
+    "glibc",
+    "gnupg2",
+    "gnutls",
+    "krb5",
+    "less",
+    "libarchive",
+    "libcap",
+    "libevent",
+    "libxml2",
+    "nghttp2",
+    "openssl",
+    "pam",
+    "pcre2",
+    "python-setuptools",
+    "python3.9",
+    "sqlite",
+    "vim"
+   ]
+  },
+  {
+   "fixture": "rockylinux-9.3-20231128.rpm.tsv",
+   "release": "rhel-9",
+   "capture": "2026-11-05",
+   "atLeast": [
+    "acl",
+    "binutils",
+    "ca-certificates",
+    "curl",
+    "expat",
+    "gcc",
+    "glib2",
+    "glibc",
+    "gnupg2",
+    "gnutls",
+    "krb5",
+    "less",
+    "libarchive",
+    "libevent",
+    "libgcrypt",
+    "libsolv",
+    "libtasn1",
+    "libxml2",
+    "nghttp2",
+    "openssl",
+    "pam",
+    "pcre2",
+    "python-setuptools",
+    "python3.9",
+    "sqlite",
+    "systemd",
+    "vim"
+   ]
+  },
+  {
+   "fixture": "rockylinux-9-resf-stock.rpm.tsv",
+   "release": "rhel-9",
+   "capture": "2026-11-05",
+   "atLeast": [
+    "acl",
+    "curl",
+    "expat",
+    "glib2",
+    "glibc",
+    "gnutls",
+    "libarchive",
+    "libevent",
+    "libgcrypt",
+    "libsolv",
+    "libxml2",
+    "nghttp2",
+    "openssl",
+    "pcre2",
+    "python3.9",
+    "sqlite",
+    "systemd",
+    "vim"
+   ]
+  },
+  {
+   "fixture": "synthetic-alma-9-php82-module-current.rpm.tsv",
+   "release": "alma-9",
+   "capture": "2026-11-05",
+   "exact": []
+  },
+  {
+   "fixture": "synthetic-alma-9-php82-module-behind.rpm.tsv",
+   "release": "alma-9",
+   "capture": "2026-11-05",
+   "exact": [
+    "php"
    ]
   }
  ]

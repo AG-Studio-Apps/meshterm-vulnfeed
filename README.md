@@ -77,7 +77,7 @@ package: hosts match `${source:Package}` / `${source:Version}`.
 Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ubuntu-20.04`, `-22.04`, `-24.04`,
 `-26.04`, `-26.10` (the current interim; 25.10 is end of life), `ubuntu-<lts>-esm` (the `Ubuntu:Pro:<lts>` rows,
 for hosts with Ubuntu Pro attached), `debian-11`, `-12`, `-13`, `alpine-3.20` .. `alpine-3.24` (`Alpine:v3.20` ..
-`Alpine:v3.24`). **alpine-3.20 (EOL 2026-04-01) and alpine-3.21 (EOL 2026-11-01) are past end of life**
+`Alpine:v3.24`), `alma-8` .. `alma-10` and `rhel-8` .. `rhel-10` (S5). **alpine-3.20 (EOL 2026-04-01) and alpine-3.21 (EOL 2026-11-01) are past end of life**
 (alpinelinux.org/releases.json). James decided (2026-11-05) to keep them while secdb still publishes their
 branches; the app's S6 adds an end-of-life note for such hosts.
 
@@ -138,6 +138,54 @@ Differences from the dpkg rules:
   fixes land, so `alpine:3.20.0` and `alpine:latest` are `atLeast` cases; `alpine:3.20` (3.20.10, end of life)
   flags nothing and is `exact: []`, the Alpine false-positive gate. Every apk case, `atLeast` too, fails on 3 or
   more unexpected origins (`EXTRA_HIT_LIMIT`); 1 or 2 warn.
+
+### AlmaLinux and RHEL (S5, `format: "rpm"`)
+
+```json
+{"release":"alma-9","format":"rpm","keyedBy":"binary",
+ "ids":["CVE-2026-0001","CVE-2026-0002","CVE-2026-0003"],
+ "fixes":[["0","1:3.5.8-2.el9_8",3,[0,1],[]],["0","8.2.33-1.module_el9.8.0+303+1bef6c12",4,[2],["php:8.2"]]],
+ "pkgs":{"openssl":[0],"openssl-libs":[0],"php-cli":[1]},
+ "kernel":{"kernel-core":[["0","5.14.0-611.5.1.el9_8",4,12,"2026-10-01"]]}}
+```
+
+Releases `alma-8`, `alma-9`, `alma-10` (OSV `AlmaLinux:<major>`) and `rhel-8`, `rhel-9`, `rhel-10` (OSV `Red Hat`:
+one file per major merging `enterprise_linux:<major>::baseos`, `::appstream` and `::crb`; RHEL 10 publishes per minor
+release, `enterprise_linux:10.0`, `10.1` ..., all merged). EUS / AUS / E4S / TUS streams and the add-on
+repositories (realtime, nfv, sap, highavailability ...) are left out: a host on them is matched against the main
+repositories only. **Rocky Linux hosts use the RHEL file**: Rocky's own OSV data is incomplete (`Rocky Linux:9` has
+no openssl-libs), and Rocky rebuilds RHEL's sources at the same NEVRA (a Rocky-only `.rocky.0.1` rebuild sorts below
+RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
+
+- **Keyed by BINARY rpm name**: OSV's EL records name binaries (`openssl`, `openssl-libs`, `openssl-devel`) and no
+  source rpm, so the file is COMPACT: a sorted CVE table, a fix table sorted by fixed EVR (`[introduced, fixed,
+  severity, [id index ...], [module stream ...]]`) and per binary the indexes of its fixes. The row count is the
+  (binary, fix) pairs plus the kernel rows. The app groups its findings by each binary's SOURCERPM.
+- **Versions** are EVRs compared by `builder/rpmver.py` (rpm-6.1.0 rpmvercmp, its own vectors shared with the app).
+- **Only records naming an upstream CVE ship** (ALBA / ALEA / most RHBA name none); `-debuginfo` / `-debugsource`
+  binaries are dropped; of the kernel's binaries only `kernel-core` and its variants (`kernel-rt-core`,
+  `kernel-64k-core`, `kernel-debug-core` ...) ship, as kernel rows dated by their advisory (the app matches
+  `kernel-core-$(uname -r)` only); `kernel`, `kernel-modules*`, `kernel-tools*`, `kernel-headers` are dropped and
+  counted.
+- **Severity**: AlmaLinux publishes no score, so its summary prefix (`Critical:` 4, `Important:` 3, `Moderate:`,
+  `Low:`) rates every id of the advisory; RHEL: the highest CVSS 3.x score of the advisories naming the id. Else
+  Medium (not shipped).
+- **Module streams**: a modular fix (`.module_el9...`, Red Hat's `.module+el9...`) carries the `name:stream` tokens
+  of its advisories' summaries (`php:8.1`; `virt:rhel` and `virt-devel:rhel` for a two-module advisory), merged over
+  every advisory naming that (binary, fix). The app compares a modular row only with a modular build of the same
+  stream (the host's MODULARITYLABEL), a plain row only with a plain build; with no label or no stream it needs the
+  same upstream major.minor. So a php:8.2 host never meets a php:8.1 or php:8.3 row.
+- **No archive, no baseline, no published check** (as Alpine): the repositories' metadata are not fetched. The
+  golden images were checked by hand instead: every binary they flag had a candidate at or above the fix in the
+  image's own repositories (`dnf repoquery`, 2026-11-05).
+- **Fit to the cap**: a file over 600 KB (only rhel-8 today, 850 KB) keeps the newest N fixes per (binary, module
+  stream), the largest N of 16, 12, 10, 8, 6, 5, 4, 3 that fits (rhel-8: 6, 8,414 rows). A host below an older fix is
+  below every newer one, so no finding is lost; it lists fewer CVEs and can show a lower severity. Logged and counted.
+- **Golden cases** (`builder/golden/*.rpm.tsv`): the app's Pro probe rpm listing from stock `almalinux:9` (9.8, the
+  EL false-positive gate: `exact: []`), `almalinux:9.2` (July 2023), `rockylinux:9` (the library image, 9.3) and
+  `rockylinux/rockylinux:9` (9.8, months behind) against rhel-9, plus two SYNTHETIC php:8.2 module listings for the
+  stream rule. Rows dated before the capture count, so the frozen images never drift; 3 or more unexpected
+  source rpms fail.
 
 **Adding a release** (every Ubuntu interim, every six months; the next is 27.04), in one pull request:
 
@@ -325,6 +373,7 @@ UTC.
 
 ## TODO
 
-- S5 (rpm) release files; an APKINDEX published check for Alpine (needs RSA verification); the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
+- An EL repository metadata published check (repomd.xml is GPG-signed; primary.xml would also give the binary to
+  source rpm map); an APKINDEX published check for Alpine (needs RSA verification); the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
   allowlist when it ships.
 - An emergency publish path in the workflow (a committed `manifest.json.minisig` mode, as in meshterm-recipes).

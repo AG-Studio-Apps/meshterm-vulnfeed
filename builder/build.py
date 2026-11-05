@@ -41,7 +41,7 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 MANIFEST_KEYS = {"schema", "version", "serial", "generated", "sources", "releases", "curated"}
 RELEASE_KEYS = {"format", "file", "sha256", "bytes", "rows"}
 RELEASE_FORMATS = ("dpkg", "apk", "rpm")
-OSV_ZIPS = ("Debian", "Ubuntu", "Alpine")
+OSV_ZIPS = ("Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # A live serial this far above the builds/ history is not a missed commit; stop and look.
@@ -339,10 +339,11 @@ def check_sources(sources, releases):
     osv, archive, baseline = sources["osv"], sources["archive"], sources["baseline"]
     if not isinstance(osv, dict) or not osv or not set(osv) <= set(OSV_ZIPS) \
             or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in osv.values()):
-        raise FeedError("sources.osv must map Debian/Ubuntu/Alpine to a UTC time")
-    # Alpine (apk) releases have no archive Sources and no baseline: archive may be empty only without dpkg.
+        raise FeedError("sources.osv must map Debian/Ubuntu/Alpine/AlmaLinux/Red Hat to a UTC time")
+    # Alpine (apk) and EL (rpm) releases have no archive Sources and no baseline: archive may be empty only
+    # without dpkg.
     needs_archive = not isinstance(releases, dict) or any(
-        not isinstance(e, dict) or e.get("format") != "apk" for e in releases.values())
+        not isinstance(e, dict) or e.get("format") not in ("apk", "rpm") for e in releases.values())
     if not isinstance(archive, dict) or (needs_archive and not archive) or len(archive) > 64 \
             or not all(isinstance(k, str) and SUITE_RE.fullmatch(k) for k in archive) \
             or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in archive.values()):

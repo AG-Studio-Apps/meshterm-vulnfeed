@@ -16,7 +16,7 @@
       "description": "Empty with no releases; otherwise exactly osv (newest OSV `modified` per ecosystem zip), archive (each suite's Release Date) and baseline (each release's release-day date).",
       "additionalProperties": false,
       "properties": {
-        "osv": {"type": "object", "propertyNames": {"enum": ["Debian", "Ubuntu", "Alpine"]},
+        "osv": {"type": "object", "propertyNames": {"enum": ["Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat"]},
                 "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},
         "archive": {"type": "object", "propertyNames": {"pattern": "^[a-z]+(-updates|-security)?$"},
                     "additionalProperties": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}},
@@ -29,7 +29,8 @@
       "propertyNames": {"enum": ["ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                                  "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
                                  "debian-11", "debian-12", "debian-13",
-                                 "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24"]},
+                                 "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24",
+                                 "alma-8", "alma-9", "alma-10", "rhel-8", "rhel-9", "rhel-10"]},
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,

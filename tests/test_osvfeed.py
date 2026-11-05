@@ -381,10 +381,13 @@ class Golden(unittest.TestCase):
         self.assertEqual({c["fixture"] for c in cases},
                          {"ubuntu-24.04-stock.tsv", "debian-12-stock.tsv", "debian-12.0-20230612.tsv",
                           "alpine-3.20-stock.apk.txt", "alpine-3.20.0-20240522.apk.txt",
-                          "alpine-3.24-stock.apk.txt"})
+                          "alpine-3.24-stock.apk.txt", "almalinux-9-stock.rpm.tsv", "almalinux-9.2-20230718.rpm.tsv",
+                          "rockylinux-9.3-20231128.rpm.tsv", "rockylinux-9-resf-stock.rpm.tsv",
+                          "synthetic-alma-9-php82-module-current.rpm.tsv",
+                          "synthetic-alma-9-php82-module-behind.rpm.tsv"})
         for case in cases:
-            if osvfeed.FORMAT_OF[case["release"]] == "apk":
-                continue    # tests/test_alpine.py
+            if osvfeed.FORMAT_OF[case["release"]] in ("apk", "rpm"):
+                continue    # tests/test_alpine.py, tests/test_rpm.py
             for name in (case["fixture"], case["archive"]):
                 path = os.path.join(directory, name)
                 self.assertLess(os.path.getsize(path), 64 * 1024, path)
