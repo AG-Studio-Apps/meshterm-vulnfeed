@@ -35,8 +35,11 @@ def _request(url, method="GET"):
     return urllib.request.Request(url, method=method, headers={"User-Agent": USER_AGENT})
 
 
+RETRY_DELAY = 5     # seconds before the first retry; then x3 (tests set 0)
+
+
 def _retry(what, func, attempts=4):
-    delay = 5
+    delay = RETRY_DELAY
     for attempt in range(1, attempts + 1):
         try:
             return func()

@@ -1,0 +1,21 @@
+{
+ "note": [
+  "Per-release row floors for the row-count gate (builder/osvfeed.py row_gate). A release below",
+  "max(this, half its previous count) is not published; its previous file is carried forward. Set 2026-11-05",
+  "to half of the first S2 build's counts. A new release needs an entry here."
+ ],
+ "minimums": {
+  "debian-11": 568,
+  "debian-12": 596,
+  "debian-13": 347,
+  "ubuntu-20.04": 875,
+  "ubuntu-20.04-esm": 261,
+  "ubuntu-22.04": 1004,
+  "ubuntu-22.04-esm": 18,
+  "ubuntu-24.04": 446,
+  "ubuntu-24.04-esm": 11,
+  "ubuntu-26.04": 60,
+  "ubuntu-26.04-esm": 3,
+  "ubuntu-26.10": 3
+ }
+}

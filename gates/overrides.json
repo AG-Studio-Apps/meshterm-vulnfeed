@@ -1,0 +1,9 @@
+{
+ "note": [
+  "Reviewed exceptions to the row-count gate. Each entry: {release, min, max, expires (YYYY-MM-DD), reason}.",
+  "While unexpired (expires >= the build date) it replaces the +-30% swing and the floor with [min, max] for that",
+  "release. Expired entries are ignored (and logged): delete them when you see them. Adding one is a commit on",
+  "main, which is the review."
+ ],
+ "rowCount": []
+}

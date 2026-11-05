@@ -1,4 +1,5 @@
 """Test helpers: throwaway minisign keys and a scratch copy of the repository layout."""
+import functools
 import os
 import shutil
 import subprocess
@@ -41,7 +42,7 @@ def scratch_repo():
 def no_releases():
     """ReleaseOptions whose S2 step builds nothing (curated-only, no network)."""
     import build
-    return build.ReleaseOptions(builder=lambda site_v1, log, previous: ({}, {}))
+    return build.ReleaseOptions(builder=lambda site_v1, log, previous, today: ({}, {}, {}))
 
 
 FAKE_SOURCES = {"osv": {"Debian": "2026-11-05T13:03:11Z"},
@@ -56,7 +57,7 @@ def fake_releases(seen=None):
     import osvfeed
     from feedlib import content_name, sha256_hex
 
-    def builder(site_v1, log, previous):
+    def builder(site_v1, log, previous, today):
         if seen is not None:
             seen.append(previous)
         release = next(r for r in osvfeed.RELEASES if r.key == "debian-12")
@@ -70,5 +71,24 @@ def fake_releases(seen=None):
         with open(os.path.join(site_v1, name), "wb") as handle:
             handle.write(data)
         return ({"debian-12": {"format": "dpkg", "file": name, "sha256": sha256_hex(data), "bytes": len(data),
-                               "rows": 2}}, dict(FAKE_SOURCES))
+                               "rows": 2}}, dict(FAKE_SOURCES), {})
     return build.ReleaseOptions(builder=builder)
+
+
+def make_gpg(directory):
+    """A throwaway gpg signing key: (public keyring path, clearsign(src, dest)). None when gpg is missing."""
+    gpg = shutil.which("gpg")
+    if gpg is None:
+        return None
+    home = os.path.join(directory, "gnupg")
+    os.makedirs(home, mode=0o700)
+    run = functools.partial(subprocess.run, check=True, capture_output=True, env=dict(os.environ, GNUPGHOME=home))
+    run([gpg, "--batch", "--passphrase", "", "--quick-gen-key", "archive@test.invalid", "ed25519", "sign", "never"])
+    keyring = os.path.join(directory, "archive-keyring.gpg")
+    with open(keyring, "wb") as handle:
+        handle.write(run([gpg, "--batch", "--export", "archive@test.invalid"]).stdout)
+
+    def clearsign(src, dest):
+        run([gpg, "--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase", "", "--clearsign",
+             "--output", dest, src])
+    return keyring, clearsign

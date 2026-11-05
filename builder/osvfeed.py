@@ -23,8 +23,10 @@ Then, per release, with the archive Sources of every pocket and component loaded
    Published check: the highest archive version of the source (any pocket, any component) must be >= fixed.
    Ubuntu Pro (ESM) rows skip this: the ESM archive needs a subscription token.
 7. Severity, per CVE id, by the ecosystem's chain (every decision counted in the log):
-   Ubuntu: Ubuntu priority, else the highest CVSS 3.x/4.0 score, else Medium.
-   Debian: the highest CVSS 3.x/4.0 score, else High when a DSA/DLA ships this fix, else Medium.
+   Ubuntu: the package's own Ubuntu priority (affected[].ecosystem_specific.ubuntu_priority), else the
+   record's, else the highest CVSS 3.x/4.0 score, else Medium.
+   Debian: the highest CVSS 3.x/4.0 score, else High when a DSA/DLA that names this id ships this fix, else
+   Medium.
    Only ids that are High or Critical stay; a row with none left is dropped.
 8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`.
 """
@@ -35,6 +37,9 @@ import json
 import lzma
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import zipfile
 
@@ -46,6 +51,13 @@ from feedlib import FILE_CAP, FeedError, content_name, sha256_hex
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASELINE_DIR = os.path.join(HERE, "baselines")
 GOLDEN_DIR = os.path.join(HERE, "golden")
+# The distro archive keyrings, pinned in the repo (keys/archive/README.md says where each came from). Every
+# suite's InRelease must carry at least one valid signature from its family's keyring and no bad one (apt's
+# rule), checked with gpgv; only then are its Sources.xz digests trusted.
+ARCHIVE_KEYRINGS = {
+    "ubuntu": os.path.join(HERE, "..", "keys", "archive", "ubuntu-archive-keyring.gpg"),
+    "debian": os.path.join(HERE, "..", "keys", "archive", "debian-archive-keyring.gpg"),
+}
 
 UBUNTU_MIRROR = "https://archive.ubuntu.com/ubuntu"
 DEBIAN_MIRROR = "https://deb.debian.org/debian"
@@ -214,11 +226,13 @@ def severity_of_record(record, counters):
 
 
 class Candidate:
-    __slots__ = ("ids", "advisory", "adv_date", "rec_date", "modified", "tokens", "kernel")
+    __slots__ = ("ids", "advisory", "advisory_ids", "pkg_priority", "adv_date", "rec_date", "modified", "tokens")
 
     def __init__(self):
         self.ids = set()
         self.advisory = False
+        self.advisory_ids = set()   # the ids a USN/DSA/DLA naming this fix lists (plan 3.2: "a DSA/DLA exists")
+        self.pkg_priority = {}      # id -> affected[].ecosystem_specific.ubuntu_priority (beats the record's)
         self.adv_date = None     # earliest advisory (USN/DSA/DLA) `published` naming this fix
         self.rec_date = None     # earliest `published` of any record naming it (fallback)
         self.modified = None     # newest `modified` of the records naming it
@@ -296,6 +310,8 @@ def ingest(zip_path, releases, log):
                     if verdict != "keep":
                         stats[f"{release.key}: excluded ({verdict})"] += len(pairs)
                         continue
+                specific = affected.get("ecosystem_specific") or {}
+                pkg_priority = _UBUNTU_PRIORITY.get(str(specific.get("ubuntu_priority", "")).lower())
                 tokens = {t for t in (leading_token(v) for v in affected.get("versions") or []
                                       if isinstance(v, str)) if t}
                 for introduced, fixed in pairs:
@@ -305,8 +321,12 @@ def ingest(zip_path, releases, log):
                         cand = candidates[release.key][(source, introduced, fixed)] = Candidate()
                     cand.ids.update(ids)
                     cand.tokens |= tokens
+                    if pkg_priority is not None and release.family == "ubuntu":
+                        for cve in ids:
+                            cand.pkg_priority[cve] = max(pkg_priority, cand.pkg_priority.get(cve, -1))
                     if is_adv:
                         cand.advisory = True
+                        cand.advisory_ids.update(ids)
                         if published and (cand.adv_date is None or published < cand.adv_date):
                             cand.adv_date = published
                     if published and (cand.rec_date is None or published < cand.rec_date):
@@ -372,15 +392,20 @@ def _release_date(text):
     raise FeedError(f"bad Release Date {text!r}")
 
 
-def parse_sources(handle):
+def parse_sources(handle, skipped=None):
     """{source: highest version text} from a Sources stream (deb822). Extra-Source-Only stanzas (old sources
-    kept only for Built-Using) are skipped."""
+    kept only for Built-Using) are skipped. A version our strict parser refuses (dpkg tolerates a few, with a
+    warning) is skipped and counted in `skipped` (a Counter), never fatal."""
     out = {}
     package = version = None
     extra = False
 
     def flush():
         if package and version and not extra:
+            if _cmp_ok(version) is None:
+                if skipped is not None:
+                    skipped["archive versions skipped (unparseable)"] += 1
+                return
             old = out.get(package)
             if old is None or DpkgVersion.parse(version) > DpkgVersion.parse(old):
                 out[package] = version
@@ -408,9 +433,32 @@ def merge_max(into, other):
             into[source] = version
 
 
-def load_suite(cache, mirror, suite, used, log, offline=False):
-    """({source: version}, Release date) for every component of one suite."""
-    release_url = f"{mirror}/dists/{suite}/Release"
+def verify_inrelease(data, keyring):
+    """The signed body of an InRelease file, after gpgv finds at least one VALIDSIG from `keyring` and no
+    BADSIG. A signature by a key the keyring lacks (an older release key) is tolerated, as apt does."""
+    gpgv = shutil.which("gpgv")
+    if gpgv is None:
+        raise FeedError("gpgv is not installed: cannot verify InRelease signatures")
+    with tempfile.TemporaryDirectory(prefix="vulnfeed-gpgv-") as home:
+        signed, plain = os.path.join(home, "InRelease"), os.path.join(home, "Release")
+        with open(signed, "wb") as handle:
+            handle.write(data)
+        result = subprocess.run([gpgv, "--homedir", home, "--status-fd", "1", "--keyring",
+                                 os.path.abspath(keyring), "--output", plain, signed],
+                                capture_output=True, timeout=120)
+        status = result.stdout.decode("utf-8", "replace").splitlines()
+        if any(line.startswith("[GNUPG:] BADSIG ") for line in status):
+            raise FeedError("InRelease has a BAD signature")
+        if not any(line.startswith("[GNUPG:] VALIDSIG ") for line in status) or not os.path.isfile(plain):
+            raise FeedError("InRelease has no valid signature from the pinned keyring")
+        with open(plain, "rb") as handle:
+            return handle.read()
+
+
+def load_suite(cache, mirror, suite, used, log, offline=False, family=None, skipped=None):
+    """({source: version}, Release date) for every component of one suite. The suite's InRelease is verified
+    against ARCHIVE_KEYRINGS[family] before any of its digests is used."""
+    release_url = f"{mirror}/dists/{suite}/InRelease"
     release_cache = os.path.join(cache, "archive", "release", re.sub(r"[^a-z0-9.-]", "_", mirror) + "_" + suite)
     if offline:
         with open(release_cache, "rb") as handle:
@@ -420,7 +468,11 @@ def load_suite(cache, mirror, suite, used, log, offline=False):
         os.makedirs(os.path.dirname(release_cache), exist_ok=True)
         with open(release_cache, "wb") as handle:
             handle.write(data)
-    date, files = parse_release(data)
+    try:
+        body = verify_inrelease(data, ARCHIVE_KEYRINGS[family])
+    except FeedError as error:
+        raise FeedError(f"{release_url}: {error}") from None
+    date, files = parse_release(body)
     if not files:
         raise FeedError(f"{release_url} lists no Sources.xz")
     versions = {}
@@ -430,9 +482,9 @@ def load_suite(cache, mirror, suite, used, log, offline=False):
                                             offline)
         fetched += new
         with lzma.open(local, "rt", encoding="utf-8", errors="replace") as handle:
-            merge_max(versions, parse_sources(handle))
-    log.info(f"archive {suite}: {len(files)} component(s), {len(versions)} sources, Release {date}"
-             f"{f', {fetched} downloaded' if fetched else ', all cached'}")
+            merge_max(versions, parse_sources(handle, skipped))
+    log.info(f"archive {suite}: InRelease signature OK, {len(files)} component(s), {len(versions)} sources, "
+             f"Release {date}{f', {fetched} downloaded' if fetched else ', all cached'}")
     return versions, date
 
 
@@ -459,7 +511,8 @@ def write_baseline(release, cache, log):
     if release.family != "debian" or not release.snapshot:
         raise FeedError(f"{release.key}: only Debian releases have a committed baseline")
     base = f"{SNAPSHOT}/{release.snapshot}"
-    data = netfetch.get_bytes(f"{base}/dists/{release.codename}/Release", netfetch.RELEASE_CAP)
+    data = verify_inrelease(netfetch.get_bytes(f"{base}/dists/{release.codename}/InRelease",
+                                               netfetch.RELEASE_CAP), ARCHIVE_KEYRINGS[release.family])
     date, files = parse_release(data)
     version_line = re.search(r"^Version: (\S+)$", data.decode("utf-8", "replace"), re.M)
     versions = {}
@@ -557,6 +610,8 @@ def severity(release, cve, cand, info):
     """(band, rule) for one id of one row, by the release family's chain (plan 3.2)."""
     ubuntu, score = info.get(cve, (None, None))
     if release.family == "ubuntu":
+        if cve in cand.pkg_priority:
+            return cand.pkg_priority[cve], "ubuntu package priority"
         if ubuntu is not None:
             return ubuntu, "ubuntu priority"
         if score is not None:
@@ -564,7 +619,7 @@ def severity(release, cve, cand, info):
         return cvss.MEDIUM, "default medium"
     if score is not None:
         return cvss.band(score), "cvss"
-    if cand.advisory:
+    if cve in cand.advisory_ids:
         return HIGH, "dsa/dla exists -> high"
     return cvss.MEDIUM, "default medium"
 
@@ -686,11 +741,13 @@ def published_before(row, capture):
 
 
 def golden_hits(rows, inventory, capture, at_capture=None):
-    """{source: [fixed, ...]} for non-kernel rows published before `capture` that the inventory is below.
-    With `at_capture` ({source: highest archive version at the capture time}), a row also needs its fix to
-    have been in the archive then, which keeps a frozen fixture from drifting when OSV later records an old
-    CVE's fix."""
+    """({source: [fixed, ...]}, [unarchived]) for non-kernel rows published before `capture` that the inventory
+    is below. With `at_capture` ({source: highest archive version at the capture time}) a row also needs its fix
+    to have been in the archive then, which keeps a frozen fixture from drifting when OSV later records an old
+    CVE's fix; a would-be hit on a source the frozen archive does not list at all is returned in `unarchived`
+    (the fixture and its archive file disagree, which is an error)."""
     hits = collections.defaultdict(list)
+    unarchived = []
     for row in rows:
         if row["kernel"] or not published_before(row, capture):
             continue
@@ -698,16 +755,20 @@ def golden_hits(rows, inventory, capture, at_capture=None):
         if installed is None:
             continue
         fixed = DpkgVersion.parse(row["fixed"])
-        if at_capture is not None:
-            then = at_capture.get(row["source"])
-            if then is None or DpkgVersion.parse(then) < fixed:
-                continue
         have = DpkgVersion.parse(installed)
         if row["introduced"] != "0" and have < DpkgVersion.parse(row["introduced"]):
             continue
-        if have < fixed:
-            hits[row["source"]].append(row["fixed"])
-    return dict(hits)
+        if not have < fixed:
+            continue
+        if at_capture is not None:
+            then = at_capture.get(row["source"])
+            if then is None:
+                unarchived.append(f"{row['source']} {row['fixed']}")
+                continue
+            if DpkgVersion.parse(then) < fixed:
+                continue
+        hits[row["source"]].append(row["fixed"])
+    return dict(hits), unarchived
 
 
 def snapshot_suites(release, stamp):
@@ -727,7 +788,7 @@ def write_golden_archive(case, cache, log, golden_dir=GOLDEN_DIR):
     inventory = read_inventory(os.path.join(golden_dir, case["fixture"]))
     merged, header = {}, []
     for mirror, suite in snapshot_suites(release, case["archiveAt"]):
-        versions, date = load_suite(cache, mirror, suite, set(), log)
+        versions, date = load_suite(cache, mirror, suite, set(), log, family=release.family)
         merge_max(merged, versions)
         header.append(f"# {mirror}/dists/{suite}/ Release {date}")
     out = os.path.join(golden_dir, case["archive"])
@@ -744,154 +805,270 @@ def write_golden_archive(case, cache, log, golden_dir=GOLDEN_DIR):
     return out
 
 
-def check_golden(rows_by_release, log, golden_dir=GOLDEN_DIR):
-    """Runs builder/golden/expected.json. Raises FeedError on a miss."""
+def golden_cases(golden_dir=GOLDEN_DIR):
     with open(os.path.join(golden_dir, "expected.json"), encoding="utf-8") as handle:
-        spec = json.load(handle)
+        return json.load(handle)["cases"]
+
+
+def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
+    """The golden cases of one release. Returns the failures (an empty list when they pass).
+
+    Errors: an expected source not flagged (a regression that drops a real fix), and a would-be hit on a
+    source the frozen archive file does not list. A flagged source the case does not expect is a WARNING:
+    every row counted is already pinned to the archive at capture, so an extra hit can only come from OSV
+    re-rating an old CVE (Medium to High) or adding ids, which is data, not a builder regression."""
     failures = []
-    for case in spec["cases"]:
-        rows = rows_by_release.get(case["release"])
-        if rows is None:
-            failures.append(f"{case['fixture']}: release {case['release']} was not built")
+    for case in golden_cases(golden_dir):
+        if case["release"] != key:
             continue
         inventory = read_inventory(os.path.join(golden_dir, case["fixture"]))
         at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
-        hits = golden_hits(rows, inventory, case["capture"], at_capture)
-        got = sorted(hits)
-        detail = ", ".join(f"{s} {inventory[s]} < {max(hits[s], key=sort_key)}" for s in got) or "none"
-        if "exact" in case and got != sorted(case["exact"]):
-            failures.append(f"{case['fixture']} ({case['release']}): hits {got}, expected exactly "
-                            f"{sorted(case['exact'])} [{detail}]")
-        elif "atLeast" in case and not set(case["atLeast"]) <= set(got):
-            failures.append(f"{case['fixture']} ({case['release']}): missing "
-                            f"{sorted(set(case['atLeast']) - set(got))} [{detail}]")
-        else:
-            log.info(f"golden {case['fixture']} ({case['release']}, before {case['capture']}): "
-                     f"{len(got)} source(s) flagged: {detail}")
-    if failures:
-        raise FeedError("golden fixtures: " + "; ".join(failures))
+        hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)
+        got = set(hits)
+        expected = set(case.get("exact", case.get("atLeast", [])))
+        detail = ", ".join(f"{s} {inventory[s]} < {max(hits[s], key=sort_key)}" for s in sorted(got)) or "none"
+        if expected - got:
+            failures.append(f"golden {case['fixture']}: missing {sorted(expected - got)} [{detail}]")
+        if unarchived:
+            failures.append(f"golden {case['fixture']}: hits on sources not in {case['archive']}: "
+                            + ", ".join(unarchived[:5]))
+        extra = sorted(got - expected) if "exact" in case else []
+        if extra:
+            log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
+                     "fix that was in the archive at capture; update expected.json if it is right)")
+        if not failures:
+            log.info(f"golden {case['fixture']} ({key}, before {case['capture']}): {len(got)} source(s) "
+                     f"flagged: {detail}")
+    return failures
+
+
+# --- row-count gates -----------------------------------------------------------------------------------
+GATES_DIR = os.path.join(HERE, "..", "gates")
+MIN_SHARE_OF_PREVIOUS = 0.5     # a release may never fall below half its previous row count
+
+
+class ConfigError(FeedError):
+    """A broken committed configuration (gates, baselines, RELEASES/RETIRED). Fails the WHOLE build: it comes
+    from a commit, not from upstream, and fail-soft must not hide it."""
+
+
+def load_gates(gates_dir=GATES_DIR, releases=RELEASES):
+    """(minimums {release: rows}, overrides [{release, min, max, expires, reason}]) from gates/."""
+    try:
+        with open(os.path.join(gates_dir, "minimums.json"), encoding="utf-8") as handle:
+            minimums = json.load(handle)["minimums"]
+        with open(os.path.join(gates_dir, "overrides.json"), encoding="utf-8") as handle:
+            overrides = json.load(handle)["rowCount"]
+    except (OSError, ValueError, KeyError) as error:
+        raise ConfigError(f"gates/: {error}") from None
+    keys = {r.key for r in releases}
+    if not isinstance(minimums, dict) or set(minimums) != keys \
+            or not all(type(v) is int and v >= 1 for v in minimums.values()):
+        raise ConfigError("gates/minimums.json must give every release in RELEASES a minimum of at least 1 row")
+    if not isinstance(overrides, list):
+        raise ConfigError("gates/overrides.json rowCount must be a list")
+    for item in overrides:
+        if not isinstance(item, dict) or set(item) != {"release", "min", "max", "expires", "reason"} \
+                or item["release"] not in keys or type(item["min"]) is not int or type(item["max"]) is not int \
+                or not 0 <= item["min"] <= item["max"] or not isinstance(item["expires"], str) \
+                or not _DAY.match(item["expires"]) or not isinstance(item["reason"], str) or not item["reason"]:
+            raise ConfigError(f"gates/overrides.json: bad override {item!r}")
+    return minimums, overrides
+
+
+def row_gate(key, rows, previous_rows, minimum, overrides, today, log):
+    """None when `rows` passes for release `key`, else the reason. An unexpired override (expires >= today)
+    replaces every other row rule with its [min, max]; expired ones are ignored and logged."""
+    for item in overrides:
+        if item["release"] != key:
+            continue
+        if item["expires"] < today:
+            log.info(f"row-count gate: {key}: override until {item['expires']} has expired, ignored")
+            continue
+        if item["min"] <= rows <= item["max"]:
+            log.info(f"row-count gate: {key}: {rows} rows within the override [{item['min']}, {item['max']}] "
+                     f"until {item['expires']} ({item['reason']})")
+            return None
+        return f"{rows} rows, outside the override [{item['min']}, {item['max']}]"
+    floor = minimum
+    if previous_rows is not None:
+        floor = max(floor, int(previous_rows * MIN_SHARE_OF_PREVIOUS + 0.999))
+    if rows < floor:
+        return f"{rows} rows, under the floor {floor} (committed minimum {minimum}, previous {previous_rows})"
+    if previous_rows is None:
+        log.info(f"row-count gate: {key}: no previous count ({rows} rows, committed minimum {minimum}), allowed")
+        return None
+    allowed = max(previous_rows * ROW_SWING, ROW_SWING_FLOOR)
+    if abs(rows - previous_rows) > allowed:
+        return f"{previous_rows} -> {rows} rows (allowed +-{allowed:.0f})"
+    return None
+
+
+# A release dropped from RELEASES must be listed here (and in the sign job's `retired` set), or the build
+# fails: that is how a removal is told apart from a release that vanished by mistake. Its files stay on Pages
+# only as carry-overs of the last builds that named them, then age out.
+RETIRED_RELEASES = ()
+
+
+def check_gone(previous, releases=RELEASES, retired=RETIRED_RELEASES):
+    keys = {r.key for r in releases}
+    if keys & set(retired):
+        raise ConfigError(f"release(s) both in RELEASES and RETIRED_RELEASES: {sorted(keys & set(retired))}")
+    gone = sorted(set(previous or {}) - keys - set(retired))
+    if gone:
+        raise ConfigError(f"release(s) in the previous build but neither in RELEASES nor RETIRED_RELEASES: {gone}")
 
 
 # --- the stage -----------------------------------------------------------------------------------------
-def check_row_swing(releases_out, previous, log):
-    """+-ROW_SWING (or ROW_SWING_FLOOR rows) against the previous build's manifest; a first build passes."""
-    if previous is None:
-        log.info("row-count gate: no previous build with releases; first build allowed")
-        return
-    problems = []
-    for key, entry in sorted(releases_out.items()):
-        old = (previous.get(key) or {}).get("rows")
-        if old is None:
-            log.info(f"row-count gate: {key} is new ({entry['rows']} rows), allowed")
-            continue
-        allowed = max(old * ROW_SWING, ROW_SWING_FLOOR)
-        if abs(entry["rows"] - old) > allowed:
-            problems.append(f"{key} {old} -> {entry['rows']} rows (allowed +-{allowed:.0f})")
-    gone = sorted(set(previous) - set(releases_out))
-    if gone:
-        problems.append(f"release(s) missing since the previous build: {gone}")
-    if problems:
-        raise FeedError("row-count gate: " + "; ".join(problems))
-    log.info("row-count gate: pass")
+_SOFT = (Exception,)
 
 
 def build_releases(site_v1, log, cache, work, previous=None, offline=False, releases=RELEASES,
-                   golden_dir=GOLDEN_DIR):
-    """Writes v1/r/<release>-<sha16>.json for every release; returns (releases, sources) for the manifest.
+                   golden_dir=GOLDEN_DIR, gates_dir=GATES_DIR, today=None, retired=RETIRED_RELEASES):
+    """Writes v1/r/<release>-<sha16>.json for every release that passes; returns (releases, sources, failures).
 
-    `previous` is the previous build's manifest `releases` (None for the first build). Intermediates (every
-    shipped row with its publish date, and the counters) go to `work`/<release>.rows.json."""
+    FAIL-SOFT per release: a fetch, ingest or gate failure of one release (or of everything its archive or OSV
+    zip feeds) lands in `failures` {release: reason}, and build.py carries that release's last published
+    entry forward. Only ConfigError (a broken committed configuration) raises. `previous` is the previous
+    build's manifest `releases` (None for the first build). Intermediates (every shipped row with its
+    publish date, every dropped row with its reason) go to `work`/<release>.rows.json."""
     started = time.time()
+    today = today or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     os.makedirs(os.path.join(site_v1, "r"), exist_ok=True)
     os.makedirs(work, exist_ok=True)
+    check_gone(previous, releases, retired)
+    minimums, overrides = load_gates(gates_dir, releases)
     sources = {"osv": {}, "archive": {}, "baseline": {}}
+    failures = {}
     used = set()
+
+    def fail(keys, reason):
+        for key in keys:
+            if key not in failures:
+                failures[key] = reason
+                log.warn(f"{key}: not rebuilt, the previous file is carried forward: {reason}")
+
+    def dependents(base):
+        return [r.key for r in releases if r.base_key == base]
 
     archives, baselines = {}, {}
     for release in releases:
         if release.esm or release.key in archives:
             continue
-        merged, release_pocket = {}, None
-        for mirror, suite in release.suites():
-            versions, date = load_suite(cache, mirror, suite, used, log, offline)
-            sources["archive"][suite] = date
-            merge_max(merged, versions)
-            if suite == release.codename:
-                release_pocket = (versions, date)
+        baseline_file = None
+        if release.family == "debian":
+            baseline_file, day = load_baseline_file(release)
+            if baseline_file is None:
+                raise ConfigError(f"{release.key}: builder/baselines/{release.key}.tsv is missing "
+                                  "(run `builder/build.py baseline`)")
+        try:
+            merged, release_pocket, dates, skipped = {}, None, {}, collections.Counter()
+            for mirror, suite in release.suites():
+                versions, date = load_suite(cache, mirror, suite, used, log, offline, release.family, skipped)
+                dates[suite] = date
+                merge_max(merged, versions)
+                if suite == release.codename:
+                    release_pocket = (versions, date)
+            if skipped:
+                log.info(f"archive {release.key}: " + ", ".join(f"{k} {v}" for k, v in skipped.items()))
+        except _SOFT as error:
+            fail(dependents(release.key), f"archive: {error}")
+            continue
+        sources["archive"].update(dates)
         archives[release.key] = merged
         if release.family == "ubuntu":
             baselines[release.key] = release_pocket[0]
             sources["baseline"][release.key] = release_pocket[1][:10]
         else:
-            data, day = load_baseline_file(release)
-            if data is None:
-                raise FeedError(f"{release.key}: builder/baselines/{release.key}.tsv is missing "
-                                "(run `builder/build.py baseline`)")
-            baselines[release.key] = data
+            baselines[release.key] = baseline_file
             sources["baseline"][release.key] = day
-    if not offline:
+    if not offline and not failures:
         netfetch.prune_by_hash(cache, used, log)
 
-    out, rows_by_release, unknown = {}, {}, []
+    out = {}
     for zip_name in sorted({r.osv_zip for r in releases}):
-        members = [r for r in releases if r.osv_zip == zip_name]
-        zip_path = netfetch.fetch_osv_zip(cache, zip_name, log, offline)
-        candidates, info, stats, shapes, newest = ingest(zip_path, members, log)
+        members = [r for r in releases if r.osv_zip == zip_name and r.key not in failures]
+        if not members:
+            continue
+        try:
+            zip_path = netfetch.fetch_osv_zip(cache, zip_name, log, offline)
+            candidates, info, stats, shapes, newest = ingest(zip_path, members, log)
+        except _SOFT as error:
+            fail([r.key for r in members], f"osv {zip_name}: {error}")
+            continue
         if newest:
             netfetch.record_highwater(cache, zip_name, newest)
             sources["osv"][zip_name] = netfetch.ts_seconds(newest)
         for key, value in sorted(stats.items()):
             if ":" not in key:
                 log.info(f"osv {zip_name}: {key} {value}")
+        if shapes:
+            log.info(f"osv {zip_name}: unknown shapes, e.g. " + "; ".join(shapes[:5]))
         zip_fixed = zip_rejected = 0
+        pending = {}
         for release in members:
-            counters, decisions = collections.Counter(), collections.Counter()
-            base = release.base_key
-            rows, examples, dropped = resolve(release, candidates[release.key], info, archives[base],
-                                              baselines[base], counters, decisions)
-            fixed_rows = len(candidates[release.key])
-            zip_fixed += fixed_rows
-            zip_rejected += counters["rejected"]
-            body = release_body(release, rows)
-            data = body_bytes(body)
-            if len(data) > FILE_CAP:
-                raise FeedError(f"{release.key}: {len(data)} bytes, over the {FILE_CAP}-byte cap")
-            name = "r/" + content_name(release.key, data)
-            with open(os.path.join(site_v1, name), "wb") as handle:
-                handle.write(data)
-            out[release.key] = {"format": "dpkg", "file": name, "sha256": sha256_hex(data), "bytes": len(data),
-                                "rows": row_count(body)}
-            rows_by_release[release.key] = rows
-            shape_count = stats[f"{release.key}: unknown range shape"]
-            if shape_count:
-                unknown.append(f"{release.key}: {shape_count}")
-            summary = {k.split(": ", 1)[1]: v for k, v in stats.items() if k.startswith(release.key + ": ")}
-            log.info(f"{release.key}: {fixed_rows} distinct fixed rows; "
-                     + ", ".join(f"{k} {v}" for k, v in sorted(counters.items()) if not k.startswith("rejected:"))
-                     + f"; {out[release.key]['rows']} rows, {len(data)} bytes -> {name}")
-            log.info(f"{release.key}: severity decisions (per id): "
-                     + (", ".join(f"{k} {v}" for k, v in sorted(decisions.items())) or "none"))
-            log.info(f"{release.key}: osv entries: " + ", ".join(f"{k} {v}" for k, v in sorted(summary.items())))
-            if counters["rejected"]:
-                log.info(f"{release.key}: rejected {counters['rejected']} ("
-                         + ", ".join(f"{k[10:]} {v}" for k, v in sorted(counters.items())
-                                     if k.startswith("rejected: ")) + "), e.g. " + "; ".join(examples[:4]))
-            kernels = sorted({r["source"] for r in rows if r["kernel"]})
-            if kernels:
-                log.info(f"{release.key}: kernel sources folded ({len(kernels)}): {' '.join(kernels)}")
-            with open(os.path.join(work, f"{release.key}.rows.json"), "w", encoding="utf-8") as handle:
-                json.dump({"release": release.key, "counters": counters, "decisions": decisions,
-                           "osv": summary, "rows": rows, "dropped": dropped}, handle, indent=0, sort_keys=True)
+            try:
+                pending[release.key] = _one_release(release, candidates[release.key], info, stats, archives,
+                                                    baselines, work, log)
+                zip_fixed += len(candidates[release.key])
+                zip_rejected += pending[release.key]["rejected"]
+            except _SOFT as error:
+                fail([release.key], f"build: {error}")
         share = zip_rejected / zip_fixed if zip_fixed else 0.0
         log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})")
         if share >= REJECT_LIMIT:
-            raise FeedError(f"osv {zip_name}: {share:.2%} of fixed versions rejected, the limit is "
-                            f"{REJECT_LIMIT:.1%}")
-        if shapes:
-            log.info(f"osv {zip_name}: unknown shapes, e.g. " + "; ".join(shapes[:5]))
-    if unknown:
-        raise FeedError("unknown range shapes (fail closed): " + ", ".join(unknown))
-    check_golden(rows_by_release, log, golden_dir)
-    check_row_swing(out, previous, log)
-    log.info(f"releases: {len(out)} built in {time.time() - started:.0f} s")
-    return out, sources
+            fail(list(pending), f"osv {zip_name}: {share:.2%} of fixed versions rejected, the limit is "
+                                f"{REJECT_LIMIT:.1%}")
+            continue
+        for key, built in sorted(pending.items()):
+            problems = []
+            if built["unknown"]:
+                problems.append(f"{built['unknown']} unknown range shape(s) (fail closed)")
+            if len(built["data"]) > FILE_CAP:
+                problems.append(f"{len(built['data'])} bytes, over the {FILE_CAP}-byte cap")
+            entry = {"format": "dpkg", "file": "r/" + content_name(key, built["data"]),
+                     "sha256": sha256_hex(built["data"]), "bytes": len(built["data"]), "rows": built["count"]}
+            try:
+                check_release_body(json.loads(built["data"]), key, entry)
+            except FeedError as error:
+                problems.append(f"schema: {error}")
+            problems += check_golden(key, built["rows"], log, golden_dir)
+            reason = row_gate(key, built["count"], ((previous or {}).get(key) or {}).get("rows"),
+                              minimums[key], overrides, today, log)
+            if reason:
+                problems.append(f"row-count gate: {reason}")
+            if problems:
+                fail([key], "; ".join(problems))
+                continue
+            with open(os.path.join(site_v1, entry["file"]), "wb") as handle:
+                handle.write(built["data"])
+            out[key] = entry
+    log.info(f"releases: {len(out)} built, {len(failures)} carried forward, in {time.time() - started:.0f} s")
+    return out, sources, failures
+
+
+def _one_release(release, cands, info, stats, archives, baselines, work, log):
+    counters, decisions = collections.Counter(), collections.Counter()
+    base = release.base_key
+    rows, examples, dropped = resolve(release, cands, info, archives[base], baselines[base], counters, decisions)
+    body = release_body(release, rows)
+    data = body_bytes(body)
+    summary = {k.split(": ", 1)[1]: v for k, v in stats.items() if k.startswith(release.key + ": ")}
+    log.info(f"{release.key}: {len(cands)} distinct fixed rows; "
+             + ", ".join(f"{k} {v}" for k, v in sorted(counters.items()) if not k.startswith("rejected:"))
+             + f"; {row_count(body)} rows, {len(data)} bytes")
+    log.info(f"{release.key}: severity decisions (per id): "
+             + (", ".join(f"{k} {v}" for k, v in sorted(decisions.items())) or "none"))
+    log.info(f"{release.key}: osv entries: " + ", ".join(f"{k} {v}" for k, v in sorted(summary.items())))
+    if counters["rejected"]:
+        log.info(f"{release.key}: rejected {counters['rejected']} ("
+                 + ", ".join(f"{k[10:]} {v}" for k, v in sorted(counters.items()) if k.startswith("rejected: "))
+                 + "), e.g. " + "; ".join(examples[:4]))
+    kernels = sorted({r["source"] for r in rows if r["kernel"]})
+    if kernels:
+        log.info(f"{release.key}: kernel sources folded ({len(kernels)}): {' '.join(kernels)}")
+    with open(os.path.join(work, f"{release.key}.rows.json"), "w", encoding="utf-8") as handle:
+        json.dump({"release": release.key, "counters": counters, "decisions": decisions,
+                   "osv": summary, "rows": rows, "dropped": dropped}, handle, indent=0, sort_keys=True)
+    return {"rows": rows, "data": data, "count": row_count(body), "rejected": counters["rejected"],
+            "unknown": stats[f"{release.key}: unknown range shape"]}

@@ -66,20 +66,75 @@ class Log:
 # --- S2: the OSV release files -------------------------------------------------------------------------
 class ReleaseOptions:
     """Where the S2 builder caches downloads and writes its intermediates. `builder` replaces the OSV
-    builder (tests); it takes (site_v1, log, previous) and returns (releases, sources)."""
+    builder (tests); it takes (site_v1, log, previous, today) and returns (releases, sources, failures)."""
 
     def __init__(self, cache="cache", work="work", offline=False, builder=None):
         self.cache, self.work, self.offline, self.builder = cache, work, offline, builder
 
 
-def build_releases(site_v1, log, options, previous):
-    """The OSV builder (builder/osvfeed.py). Returns (releases, sources) for the manifest; each release file
-    is written under site_v1/r/ with feedlib.content_name(). `previous` is the previous build's manifest
-    `releases` (None when there is none), for the row-count gate."""
-    if options.builder is not None:
-        return options.builder(site_v1, log, previous)
-    return osvfeed.build_releases(site_v1, log, options.cache, options.work, previous=previous,
-                                  offline=options.offline)
+def build_releases(site_v1, log, options, previous, today):
+    """The OSV builder (builder/osvfeed.py). Returns (releases, sources, failures {release: reason}).
+
+    S2 is FAIL-SOFT: a failing release is reported in `failures` (and carried forward by the caller), and if
+    the whole S2 step fails every release is. Only osvfeed.ConfigError (a broken committed configuration)
+    propagates and fails the build, like an invalid curated file."""
+    try:
+        if options.builder is not None:
+            return options.builder(site_v1, log, previous, today)
+        return osvfeed.build_releases(site_v1, log, options.cache, options.work, previous=previous,
+                                      offline=options.offline, today=today)
+    except osvfeed.ConfigError:
+        raise
+    except Exception as error:  # noqa: BLE001 - fail-soft by design: the curated feed must still publish
+        log.warn(f"S2 failed entirely ({type(error).__name__}: {error}); every release is carried forward")
+        return {}, {}, {key: f"S2 failed: {error}"[:300] for key in osvfeed.RELEASE_KEYS}
+
+
+def carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log):
+    """For each failed release, put its last published entry (same file, sha256, bytes, rows: from the newest
+    builds/ record that names it) back in `releases`, with the file fetched from the live site and checked
+    against that sha256. Returns the build record's unsigned `stale` field: {release: {since, reason}}, where
+    `since` is when the release first went stale (kept across builds). A release with no previous entry, or
+    whose file cannot be fetched, is left out and says so."""
+    last_stale = (past[0][1].get("stale") or {}) if past else {}
+    stale = {}
+    for key, reason in sorted(failures.items()):
+        entry = None
+        for serial, record in past:
+            candidate = ((record.get("manifest") or {}).get("releases") or {}).get(key)
+            if candidate:
+                entry = dict(candidate)
+                break
+        since = (last_stale.get(key) or {}).get("since") or now
+        stale[key] = {"since": since, "reason": reason[:300]}
+        if entry is None:
+            stale[key]["omitted"] = True
+            log.warn(f"{key}: failed and no previous build published it; left out")
+            continue
+        dest = os.path.join(site_v1, entry["file"])
+        if not os.path.isfile(dest):
+            try:
+                if not carry_base:
+                    raise FeedError("no --carry-base")
+                data = _fetch(carry_base, entry["file"])
+                if sha256_hex(data) != entry["sha256"] or len(data) != entry["bytes"]:
+                    raise FeedError("sha256/bytes do not match its builds/ record")
+            except (OSError, urllib.error.URLError, FeedError) as error:
+                stale[key]["omitted"] = True
+                log.warn(f"{key}: cannot carry {entry['file']} forward ({error}); left out")
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as handle:
+                handle.write(data)
+        releases[key] = entry
+        log.warn(f"{key}: STALE since {since}: published the previous {entry['file']} ({reason[:200]})")
+    if releases and stale:
+        previous_sources = ((past[0][1].get("manifest") or {}).get("sources") or {}) if past else {}
+        for part in ("osv", "archive", "baseline"):
+            merged = dict(previous_sources.get(part) or {})
+            merged.update(sources.get(part) or {})
+            sources[part] = merged
+    return stale
 
 
 # --- history -------------------------------------------------------------------------------------------
@@ -330,7 +385,10 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
     for _, record in past:
         previous = (record.get("manifest") or {}).get("releases") or None
         break
-    releases, sources = build_releases(site_v1, log, options, previous)
+    releases, sources, failures = build_releases(site_v1, log, options, previous, now[:10])
+    stale = carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log)
+    if not releases:
+        sources = {}
 
     manifest = {
         "schema": MANIFEST_SCHEMA,
@@ -351,6 +409,7 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
         "commit": commit,
         "manifest": manifest,
         "carried": carried,
+        "stale": stale,
         "log": log.lines,
         "warnings": log.warnings,
     }

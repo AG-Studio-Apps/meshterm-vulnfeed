@@ -7,6 +7,7 @@ import unittest
 
 import helpers
 import build
+import osvfeed
 from feedlib import FeedError, dumps
 
 NOW = "2026-11-05T05:10:00Z"
@@ -235,8 +236,8 @@ class ReleaseTests(unittest.TestCase):
         with open(os.path.join(self.repo, "builds", "1.json"), "wb") as handle:
             handle.write(dumps(self.record))
 
-        def other(site_v1, log, previous):
-            return {}, {}
+        def other(site_v1, log, previous, today):
+            return {}, {}, {}
         manifest, record = build.build(self.repo, self.out, helpers.COMMIT, NOW, None, site,
                                        build.Log(echo=False), build.ReleaseOptions(builder=other))
         self.assertIn(self.manifest["releases"]["debian-12"]["file"], record["carried"])
@@ -286,11 +287,97 @@ class ReleaseTests(unittest.TestCase):
                     build.gate(self.out, build.Log(echo=False))
 
 
+class FailSoftTests(unittest.TestCase):
+    """S2 failures never stop the curated feed: a failed release's previous entry is carried forward and the
+    build record says since when (plan review: availability)."""
+
+    def setUp(self):
+        self.repo = helpers.scratch_repo()
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.out = os.path.join(self.repo, "out")
+        self.site = os.path.join(self.repo, "live")
+
+    def build(self, options, now):
+        log = build.Log(echo=False)
+        manifest, record = build.build(self.repo, self.out, helpers.COMMIT, now, None, self.site, log, options)
+        with open(os.path.join(self.repo, "builds", f"{record['serial']}.json"), "wb") as handle:
+            handle.write(dumps(record))
+        if os.path.exists(self.site):
+            shutil.rmtree(self.site)
+        shutil.copytree(self.out, self.site)          # "deploy"
+        return manifest, record, log
+
+    @staticmethod
+    def failing(reason="archive: HTTP 503"):
+        return build.ReleaseOptions(builder=lambda site_v1, log, previous, today: ({}, {},
+                                                                                     {"debian-12": reason}))
+
+    def test_failed_release_is_carried_forward_with_a_stale_marker(self):
+        good, _, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+        entry = good["releases"]["debian-12"]
+        manifest, record, log = self.build(self.failing(), "2026-11-05T17:10:00Z")
+        self.assertEqual(manifest["releases"], {"debian-12": entry}, "same file, sha256, bytes and rows")
+        self.assertEqual(manifest["sources"], good["sources"])
+        self.assertEqual(record["stale"], {"debian-12": {"since": "2026-11-05T17:10:00Z",
+                                                         "reason": "archive: HTTP 503"}})
+        self.assertNotIn("stale", manifest, "the marker is in the unsigned record, not the app format")
+        self.assertTrue(any("STALE since" in w for w in log.warnings))
+        build.gate(self.out, build.Log(echo=False))
+        # Still failing: `since` keeps the first time. Recovered: no marker.
+        _, record, _ = self.build(self.failing("osv Debian: timeout"), "2026-11-06T05:10:00Z")
+        self.assertEqual(record["stale"]["debian-12"]["since"], "2026-11-05T17:10:00Z")
+        self.assertEqual(record["stale"]["debian-12"]["reason"], "osv Debian: timeout")
+        manifest, record, _ = self.build(helpers.fake_releases(), "2026-11-06T17:10:00Z")
+        self.assertEqual(record["stale"], {})
+
+    def test_carried_forward_beyond_the_kept_builds(self):
+        good, _, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+        for n, now in enumerate(("2026-11-05T17:10:00Z", "2026-11-06T05:10:00Z", "2026-11-06T17:10:00Z",
+                                 "2026-11-07T05:10:00Z")):
+            manifest, record, _ = self.build(self.failing(), now)
+            self.assertEqual(manifest["releases"], good["releases"], n)
+            build.gate(self.out, build.Log(echo=False))
+
+    def test_whole_s2_failure_still_publishes_curated(self):
+        good, _, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+
+        def boom(site_v1, log, previous, today):
+            raise RuntimeError("disk full")
+        manifest, record, log = self.build(build.ReleaseOptions(builder=boom), "2026-11-05T17:10:00Z")
+        self.assertEqual(manifest["releases"], good["releases"])
+        self.assertEqual(manifest["curated"], good["curated"])
+        self.assertIn("S2 failed: disk full", record["stale"]["debian-12"]["reason"])
+        self.assertTrue(any("S2 failed entirely" in w for w in log.warnings))
+
+    def test_failure_with_nothing_to_carry(self):
+        manifest, record, _ = self.build(self.failing(), "2026-11-05T05:10:00Z")
+        self.assertEqual((manifest["releases"], manifest["sources"]), ({}, {}))
+        self.assertTrue(record["stale"]["debian-12"]["omitted"])
+
+    def test_config_errors_fail_the_build(self):
+        def broken(site_v1, log, previous, today):
+            raise osvfeed.ConfigError("gates/minimums.json: bad")
+        with self.assertRaises(FeedError):
+            build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                        options=build.ReleaseOptions(builder=broken))
+
+    def test_retired_release_files_age_out(self):
+        good, _, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+        name = good["releases"]["debian-12"]["file"]
+        retired = build.ReleaseOptions(builder=lambda site_v1, log, previous, today: ({}, {}, {}))
+        present = []
+        for now in ("2026-11-05T17:10:00Z", "2026-11-06T05:10:00Z", "2026-11-06T17:10:00Z"):
+            manifest, record, _ = self.build(retired, now)
+            self.assertEqual(manifest["releases"], {})
+            present.append(os.path.exists(os.path.join(self.out, "v1", name)))
+        self.assertEqual(present, [True, True, False], "kept as a carry-over for the next 2 builds, then gone")
+
+
 class SeamTests(unittest.TestCase):
     def test_the_builder_option_replaces_s2(self):
-        options = build.ReleaseOptions(builder=lambda site_v1, log, previous: ({}, {"seen": previous}))
-        self.assertEqual(build.build_releases("/nonexistent", build.Log(echo=False), options, {"x": 1}),
-                         ({}, {"seen": {"x": 1}}))
+        options = build.ReleaseOptions(builder=lambda site_v1, log, previous, today: ({}, {"seen": previous}, {}))
+        self.assertEqual(build.build_releases("/nonexistent", build.Log(echo=False), options, {"x": 1},
+                                              "2026-11-05"), ({}, {"seen": {"x": 1}}, {}))
 
 
 if __name__ == "__main__":

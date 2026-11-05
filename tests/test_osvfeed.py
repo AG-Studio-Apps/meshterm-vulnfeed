@@ -15,6 +15,8 @@ import netfetch
 import osvfeed
 from feedlib import FeedError
 
+netfetch.RETRY_DELAY = 0
+
 UBU = osvfeed.Release("ubuntu-24.04", "ubuntu", "Ubuntu:24.04:LTS", "noble")
 ESM = osvfeed.Release("ubuntu-24.04-esm", "ubuntu", "Ubuntu:Pro:24.04:LTS", "noble", esm=True)
 DEB = osvfeed.Release("debian-12", "debian", "Debian:12", "bookworm", snapshot="20230611T000000Z")
@@ -339,24 +341,25 @@ class Golden(unittest.TestCase):
         rows = [self.row("apt", "2.6.2", date="2026-11-04"),
                 self.row("glibc", "2.36-9+deb12u14", date="2026-11-06"),          # after capture: not counted
                 self.row("curl", "7.88.1-10+deb12u4")]                              # installed is newer
-        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05"), {"apt": ["2.6.2"]})
+        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05"), ({"apt": ["2.6.2"]}, []))
 
     def test_archive_at_capture_keeps_fixtures_frozen(self):
         # An old CVE whose fix OSV records after the capture: dated 2025, but not in the archive at capture.
         inventory = {"apt": "2.6.1", "curl": "7.88.1-10+deb12u5"}
         rows = [self.row("apt", "2.6.2", date="2026-11-04"),
                 self.row("curl", "7.88.1-10+deb12u6", date="2025-01-01", source_kind="record")]
-        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05"),
+        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05")[0],
                          {"apt": ["2.6.2"], "curl": ["7.88.1-10+deb12u6"]})
         at_capture = {"apt": "2.6.2", "curl": "7.88.1-10+deb12u5"}
-        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05", at_capture), {"apt": ["2.6.2"]})
+        self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05", at_capture), ({"apt": ["2.6.2"]}, []))
+        # A would-be hit on a source the frozen archive does not list is reported, not silently skipped.
         self.assertEqual(osvfeed.golden_hits(rows, inventory, "2026-11-05", {"curl": "9"}),
-                         {"curl": ["7.88.1-10+deb12u6"]})
+                         ({"curl": ["7.88.1-10+deb12u6"]}, ["apt 2.6.2"]))
 
     def test_introduced_respected(self):
-        rows = [self.row("x", "2.0-3", intro="2.0-1")]
-        self.assertEqual(osvfeed.golden_hits(rows, {"x": "1.9-1"}, "2026-11-05"), {})
-        self.assertEqual(osvfeed.golden_hits(rows, {"x": "2.0-2"}, "2026-11-05"), {"x": ["2.0-3"]})
+        rows = [self.row("xx", "2.0-3", intro="2.0-1")]
+        self.assertEqual(osvfeed.golden_hits(rows, {"xx": "1.9-1"}, "2026-11-05")[0], {})
+        self.assertEqual(osvfeed.golden_hits(rows, {"xx": "2.0-2"}, "2026-11-05")[0], {"xx": ["2.0-3"]})
 
     def test_inventory_parsing(self):
         tmp = tempfile.mkdtemp()
@@ -372,56 +375,115 @@ class Golden(unittest.TestCase):
 
     def test_real_fixtures_are_small_and_parse(self):
         directory = osvfeed.GOLDEN_DIR
-        with open(os.path.join(directory, "expected.json")) as handle:
-            spec = json.load(handle)
-        self.assertEqual(len(spec["cases"]), 3)
-        for case in spec["cases"]:
-            path = os.path.join(directory, case["fixture"])
-            self.assertLess(os.path.getsize(path), 64 * 1024, path)
-            self.assertTrue(osvfeed.read_inventory(path))
-        stock = osvfeed.read_inventory(os.path.join(directory, "debian-12-stock.tsv"))
-        self.assertEqual(stock["apt"], "2.6.1")
+        cases = osvfeed.golden_cases(directory)
+        self.assertEqual({c["fixture"] for c in cases},
+                         {"ubuntu-24.04-stock.tsv", "debian-12-stock.tsv", "debian-12.0-20230612.tsv"})
+        for case in cases:
+            for name in (case["fixture"], case["archive"]):
+                path = os.path.join(directory, name)
+                self.assertLess(os.path.getsize(path), 64 * 1024, path)
+                self.assertTrue(osvfeed.read_inventory(path))
+            # Every fixture source has a frozen archive version (stock images: all from the archive).
+            self.assertLessEqual(set(osvfeed.read_inventory(os.path.join(directory, case["fixture"]))),
+                                 set(osvfeed.read_inventory(os.path.join(directory, case["archive"]))))
 
-    def test_check_golden_reports_misses(self):
+    def write_case(self, tmp, **case):
+        with open(os.path.join(tmp, "inv.tsv"), "w") as handle:
+            handle.write("apt\t2.6.1\nsed\t4.9-1\npcre2\t10.42-1\n")
+        with open(os.path.join(tmp, "inv.archive.tsv"), "w") as handle:
+            handle.write("apt\t2.6.2\nsed\t4.9-1+deb12u1\npcre2\t10.42-1+deb12u2\n")
+        base = {"fixture": "inv.tsv", "release": "debian-12", "capture": "2026-11-05", "archive": "inv.archive.tsv"}
+        base.update(case)
+        with open(os.path.join(tmp, "expected.json"), "w") as handle:
+            json.dump({"cases": [base]}, handle)
+
+    def test_check_golden_errors_and_warnings(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
-        with open(os.path.join(tmp, "inv.tsv"), "w") as handle:
-            handle.write("apt\t2.6.1\nsed\t4.9-1\n")
-        with open(os.path.join(tmp, "expected.json"), "w") as handle:
-            json.dump({"cases": [{"fixture": "inv.tsv", "release": "debian-12", "capture": "2026-11-05",
-                                  "atLeast": ["apt", "sed"]}]}, handle)
         log = helpers_log()
-        osvfeed.check_golden({"debian-12": [self.row("apt", "2.6.2"), self.row("sed", "4.9-1+deb12u1")]}, log, tmp)
-        with self.assertRaisesRegex(FeedError, "missing \\['sed'\\]"):
-            osvfeed.check_golden({"debian-12": [self.row("apt", "2.6.2")]}, log, tmp)
-        with open(os.path.join(tmp, "expected.json"), "w") as handle:
-            json.dump({"cases": [{"fixture": "inv.tsv", "release": "debian-12", "capture": "2026-11-05",
-                                  "exact": []}]}, handle)
-        with self.assertRaisesRegex(FeedError, "expected exactly"):
-            osvfeed.check_golden({"debian-12": [self.row("apt", "2.6.2")]}, log, tmp)
-
-
-class RowSwing(unittest.TestCase):
-    def entry(self, rows):
-        return {"format": "dpkg", "file": "r/x-0000000000000000.json", "sha256": "0" * 64, "bytes": 1, "rows": rows}
-
-    def test_first_build_allowed(self):
+        self.write_case(tmp, atLeast=["apt", "sed"])
+        self.assertEqual(osvfeed.check_golden("debian-12", [self.row("apt", "2.6.2"), self.row("sed", "4.9-1+deb12u1")],
+                                              log, tmp), [])
+        self.assertEqual(osvfeed.check_golden("ubuntu-24.04", [], log, tmp), [], "other releases' cases skipped")
+        missing = osvfeed.check_golden("debian-12", [self.row("apt", "2.6.2")], log, tmp)
+        self.assertEqual(len(missing), 1)
+        self.assertIn("missing ['sed']", missing[0])
+        # exact: an extra hit (OSV re-rated pcre2's Medium fix to High) is a WARNING, a missing one an error.
+        self.write_case(tmp, exact=["apt"])
         log = helpers_log()
-        osvfeed.check_row_swing({"debian-12": self.entry(500)}, None, log)
-        self.assertIn("first build allowed", log.lines[-1])
+        self.assertEqual(osvfeed.check_golden("debian-12", [self.row("apt", "2.6.2"),
+                                                            self.row("pcre2", "10.42-1+deb12u2")], log, tmp), [])
+        self.assertTrue(any("also flags ['pcre2']" in w for w in log.warnings), log.warnings)
+        self.assertIn("missing ['apt']", osvfeed.check_golden("debian-12", [], log, tmp)[0])
+        # A hit on a source the frozen archive file lacks is an error.
+        unarchived = osvfeed.check_golden("debian-12", [self.row("apt", "2.6.2"), self.row("zstd", "1.5.4-2+deb12u1")],
+                                          log, tmp)
+        self.assertEqual(unarchived, [])  # zstd is not installed: no hit at all
+        with open(os.path.join(tmp, "inv.tsv"), "a") as handle:
+            handle.write("zstd\t1.5.4-2\n")
+        unarchived = osvfeed.check_golden("debian-12", [self.row("apt", "2.6.2"), self.row("zstd", "1.5.4-2+deb12u1")],
+                                          log, tmp)
+        self.assertIn("not in inv.archive.tsv", unarchived[0])
 
-    def test_swing_limits(self):
-        log = helpers_log()
-        osvfeed.check_row_swing({"debian-12": self.entry(129)}, {"debian-12": self.entry(100)}, log)
-        osvfeed.check_row_swing({"debian-12": self.entry(1290)}, {"debian-12": self.entry(1000)}, log)
-        with self.assertRaisesRegex(FeedError, "debian-12 1000 -> 1301"):
-            osvfeed.check_row_swing({"debian-12": self.entry(1301)}, {"debian-12": self.entry(1000)}, log)
-        with self.assertRaisesRegex(FeedError, "699"):
-            osvfeed.check_row_swing({"debian-12": self.entry(699)}, {"debian-12": self.entry(1000)}, log)
-        # Small files: the floor allows +-25 rows.
-        osvfeed.check_row_swing({"ubuntu-26.10": self.entry(30)}, {"ubuntu-26.10": self.entry(6)}, log)
-        with self.assertRaisesRegex(FeedError, "missing since the previous build"):
-            osvfeed.check_row_swing({}, {"debian-12": self.entry(10)}, log)
+
+class RowGates(unittest.TestCase):
+    def gate(self, rows, previous, minimum=1, overrides=(), today="2026-11-05"):
+        return osvfeed.row_gate("debian-12", rows, previous, minimum, list(overrides), today, helpers_log())
+
+    def test_first_build_uses_the_committed_minimum(self):
+        self.assertIsNone(self.gate(500, None, minimum=400))
+        self.assertIn("under the floor 400", self.gate(399, None, minimum=400))
+
+    def test_swing(self):
+        self.assertIsNone(self.gate(1290, 1000))
+        self.assertIsNone(self.gate(710, 1000))
+        self.assertIn("1000 -> 1301", self.gate(1301, 1000))
+        self.assertIn("1000 -> 699", self.gate(699, 1000))
+
+    def test_small_files_cannot_go_to_zero(self):
+        # The 25-row swing floor would allow 6 -> 0; the half-of-previous floor (and the minimum) refuse it.
+        self.assertIsNone(self.gate(30, 6))
+        self.assertIn("under the floor 3", self.gate(0, 6))
+        self.assertIn("under the floor 3", self.gate(2, 6))
+        self.assertIn("under the floor 3", self.gate(0, None, minimum=3))
+
+    def test_override(self):
+        live = {"release": "debian-12", "min": 100, "max": 3000, "expires": "2026-11-30", "reason": "DSA backlog"}
+        self.assertIsNone(self.gate(2500, 1000, overrides=[live]))
+        self.assertIn("outside the override", self.gate(50, 1000, overrides=[live]))
+        expired = dict(live, expires="2026-11-04")
+        self.assertIn("1000 -> 2500", self.gate(2500, 1000, overrides=[expired]))
+        other = dict(live, release="debian-13")
+        self.assertIn("1000 -> 2500", self.gate(2500, 1000, overrides=[other]))
+
+    def test_committed_gates_are_valid(self):
+        minimums, overrides = osvfeed.load_gates()
+        self.assertEqual(set(minimums), set(osvfeed.RELEASE_KEYS))
+        self.assertIsInstance(overrides, list)
+
+    def test_bad_gates_are_config_errors(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        good_min = {"minimums": {k: 1 for k in osvfeed.RELEASE_KEYS}}
+        for minimums, overrides in (({"minimums": {"debian-12": 1}}, {"rowCount": []}),
+                                    (good_min, {"rowCount": [{"release": "debian-12", "min": 5, "max": 1,
+                                                              "expires": "2026-12-01", "reason": "x"}]}),
+                                    (good_min, {"rowCount": [{"release": "debian-12", "min": 1, "max": 5,
+                                                              "expires": "soon", "reason": "x"}]})):
+            with open(os.path.join(tmp, "minimums.json"), "w") as handle:
+                json.dump(minimums, handle)
+            with open(os.path.join(tmp, "overrides.json"), "w") as handle:
+                json.dump(overrides, handle)
+            with self.assertRaises(osvfeed.ConfigError):
+                osvfeed.load_gates(tmp)
+
+    def test_gone_needs_retired(self):
+        previous = {"debian-12": {}, "ubuntu-25.10": {}}
+        with self.assertRaisesRegex(osvfeed.ConfigError, "ubuntu-25.10"):
+            osvfeed.check_gone(previous)
+        osvfeed.check_gone(previous, retired=("ubuntu-25.10",))
+        with self.assertRaisesRegex(osvfeed.ConfigError, "both"):
+            osvfeed.check_gone(previous, retired=("debian-12",))
 
 
 class ReleaseBody(unittest.TestCase):
@@ -448,26 +510,24 @@ class ReleaseBody(unittest.TestCase):
 
 
 class EndToEnd(unittest.TestCase):
-    """build_releases() over file:// mirrors: fake OSV zip + modified_id.csv, fake Release + Sources.xz."""
+    """build_releases() over file:// mirrors: fake OSV zip + modified_id.csv, fake signed InRelease + Sources.xz."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="vulnfeed-e2e-")
         self.addCleanup(shutil.rmtree, self.tmp)
-        mirror = os.path.join(self.tmp, "mirror")
+        signer = helpers.make_gpg(self.tmp)
+        if signer is None:
+            self.skipTest("gpg is not installed")
+        keyring, self.clearsign = signer
+        self.patch(osvfeed, "ARCHIVE_KEYRINGS", {"ubuntu": keyring, "debian": keyring})
+        self.mirror = os.path.join(self.tmp, "mirror")
         osv = os.path.join(self.tmp, "osv", "Ubuntu")
         os.makedirs(osv)
         for suite, sources in (("noble", "Package: openssl\nVersion: 3.0.13-0ubuntu3\n"),
-                               ("noble-updates", "Package: openssl\nVersion: 3.0.13-0ubuntu3.6\n"),
+                               ("noble-updates", "Package: openssl\nVersion: 3.0.13-0ubuntu3.6\n\n"
+                                                 "Package: oddity\nVersion: 1.0 beta\n"),
                                ("noble-security", "Package: linux-gcp\nVersion: 6.8.0-1020.21\n")):
-            directory = os.path.join(mirror, "dists", suite, "main", "source")
-            os.makedirs(directory)
-            data = lzma.compress(sources.encode())
-            with open(os.path.join(directory, "Sources.xz"), "wb") as handle:
-                handle.write(data)
-            digest = netfetch.hashlib.sha256(data).hexdigest()
-            with open(os.path.join(mirror, "dists", suite, "Release"), "w") as handle:
-                handle.write(f"Suite: {suite}\nDate: Thu, 25 Apr 2024 15:10:33 UTC\nSHA256:\n"
-                             f" {digest} {len(data)} main/source/Sources.xz\n")
+            self.write_suite(suite, sources)
         write_zip(os.path.join(osv, "all.zip"), [
             record("UBUNTU-CVE-2026-0050", [affected("Ubuntu:24.04:LTS", "openssl", fixed("3.0.13-0ubuntu3.6")),
                                             affected("Ubuntu:24.04:LTS", "openssl", fixed("3.0.13-0ubuntu3.9"))],
@@ -484,57 +544,129 @@ class EndToEnd(unittest.TestCase):
         os.makedirs(self.golden)
         with open(os.path.join(self.golden, "inv.tsv"), "w") as handle:
             handle.write("openssl\t3.0.13-0ubuntu3.5\n")
+        with open(os.path.join(self.golden, "inv.archive.tsv"), "w") as handle:
+            handle.write("openssl\t3.0.13-0ubuntu3.6\n")
         with open(os.path.join(self.golden, "expected.json"), "w") as handle:
             json.dump({"cases": [{"fixture": "inv.tsv", "release": "ubuntu-24.04", "capture": "2026-11-05",
-                                  "exact": ["openssl"]}]}, handle)
-        self.patch(osvfeed, "UBUNTU_MIRROR", "file://" + mirror)
+                                  "archive": "inv.archive.tsv", "exact": ["openssl"]}]}, handle)
+        self.gates = os.path.join(self.tmp, "gates")
+        os.makedirs(self.gates)
+        self.write_gates({"ubuntu-24.04": 1})
+        self.patch(osvfeed, "UBUNTU_MIRROR", "file://" + self.mirror)
         self.patch(netfetch, "OSV_BASE", "file://" + os.path.join(self.tmp, "osv"))
+
+    def write_suite(self, suite, sources, sign=True):
+        directory = os.path.join(self.mirror, "dists", suite, "main", "source")
+        os.makedirs(directory, exist_ok=True)
+        data = lzma.compress(sources.encode())
+        with open(os.path.join(directory, "Sources.xz"), "wb") as handle:
+            handle.write(data)
+        digest = netfetch.hashlib.sha256(data).hexdigest()
+        release = os.path.join(self.mirror, "dists", suite, "Release")
+        with open(release, "w") as handle:
+            handle.write(f"Suite: {suite}\nDate: Thu, 25 Apr 2024 15:10:33 UTC\nSHA256:\n"
+                         f" {digest} {len(data)} main/source/Sources.xz\n")
+        inrelease = os.path.join(self.mirror, "dists", suite, "InRelease")
+        if sign:
+            self.clearsign(release, inrelease)
+        else:
+            shutil.copy(release, inrelease)
+
+    def write_gates(self, minimums, overrides=()):
+        with open(os.path.join(self.gates, "minimums.json"), "w") as handle:
+            json.dump({"minimums": minimums}, handle)
+        with open(os.path.join(self.gates, "overrides.json"), "w") as handle:
+            json.dump({"rowCount": list(overrides)}, handle)
 
     def patch(self, module, name, value):
         old = getattr(module, name)
         setattr(module, name, value)
         self.addCleanup(setattr, module, name, old)
 
-    def test_build(self):
+    def run_build(self, previous=None, cache="cache", log=None):
         site = os.path.join(self.tmp, "site", "v1")
-        cache, work = os.path.join(self.tmp, "cache"), os.path.join(self.tmp, "work")
-        log = helpers_log()
-        releases, sources = osvfeed.build_releases(site, log, cache, work, releases=[UBU],
-                                                   golden_dir=self.golden)
+        log = log or helpers_log()
+        result = osvfeed.build_releases(site, log, os.path.join(self.tmp, cache), os.path.join(self.tmp, "work"),
+                                        previous=previous, releases=[UBU], golden_dir=self.golden,
+                                        gates_dir=self.gates, today="2026-11-05")
+        return site, log, result
+
+    def test_build(self):
+        site, log, (releases, sources, failures) = self.run_build()
+        self.assertEqual(failures, {})
         entry = releases["ubuntu-24.04"]
         self.assertEqual(entry["rows"], 2)
         with open(os.path.join(site, entry["file"]), "rb") as handle:
             data = handle.read()
         self.assertEqual(netfetch.hashlib.sha256(data).hexdigest(), entry["sha256"])
-        self.assertTrue(entry["file"].startswith("r/ubuntu-24.04-") and entry["file"].endswith(".json"))
         body = json.loads(data)
         self.assertEqual(body["pkgs"], {"openssl": [["0", "3.0.13-0ubuntu3.6", 3, ["CVE-2026-0050"]]]})
         self.assertEqual(body["kernel"], {"linux-gcp": [["0", "6.8.0-1020.21", 3, 1, "2026-01-10"]]})
         self.assertEqual(sources["osv"], {"Ubuntu": "2026-02-03T04:05:06Z"})
         self.assertEqual(sources["baseline"], {"ubuntu-24.04": "2024-04-25"})
         self.assertEqual(set(sources["archive"]), {"noble", "noble-updates", "noble-security"})
-        with open(os.path.join(work, "ubuntu-24.04.rows.json")) as handle:
+        self.assertTrue(any("InRelease signature OK" in line for line in log.lines))
+        self.assertTrue(any("archive versions skipped (unparseable) 1" in line for line in log.lines), log.lines)
+        with open(os.path.join(self.tmp, "work", "ubuntu-24.04.rows.json")) as handle:
             work_rows = json.load(handle)["rows"]
         self.assertEqual({r["source"]: r["date"] for r in work_rows},
                          {"openssl": "2026-02-02", "linux-gcp": "2026-01-10"})
-        self.assertTrue(any("unpublished: archive below fixed 1" in line for line in log.lines))
         # The zip is not downloaded again while modified_id.csv shows nothing newer.
-        log2 = helpers_log()
-        osvfeed.build_releases(site, log2, cache, work, releases=[UBU], golden_dir=self.golden)
+        _, log2, _ = self.run_build()
         self.assertTrue(any("download skipped" in line for line in log2.lines), log2.lines)
         self.assertTrue(any("all cached" in line for line in log2.lines))
 
-    def test_unknown_shape_fails_closed(self):
+    def test_unsigned_inrelease_fails_only_that_release(self):
+        self.write_suite("noble-security", "Package: linux-gcp\nVersion: 6.8.0-1020.21\n", sign=False)
+        site, log, (releases, sources, failures) = self.run_build()
+        self.assertEqual(releases, {})
+        self.assertIn("no valid signature", failures["ubuntu-24.04"])
+        self.assertIn("ubuntu-24.04-esm", osvfeed.RELEASE_KEYS)
+
+    def test_tampered_sources_fails_soft(self):
+        path = os.path.join(self.mirror, "dists", "noble", "main", "source", "Sources.xz")
+        with open(path, "wb") as handle:
+            handle.write(lzma.compress(b"Package: openssl\nVersion: 9.9\n"))
+        _, _, (releases, _, failures) = self.run_build()
+        self.assertEqual(releases, {})
+        self.assertIn("(truncated?)", failures["ubuntu-24.04"])   # size first, then the digest
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 100)                                 # same size, other bytes
+        _, _, (releases, _, failures) = self.run_build(cache="cache4")
+        self.assertIn("does not match its Release file", failures["ubuntu-24.04"])
+
+    def test_unknown_shape_fails_soft(self):
         osv = os.path.join(self.tmp, "osv", "Ubuntu")
         write_zip(os.path.join(osv, "all.zip"), [
-            record("UBUNTU-CVE-2026-0060", [{"package": {"ecosystem": "Ubuntu:24.04:LTS", "name": "x"},
+            record("UBUNTU-CVE-2026-0060", [{"package": {"ecosystem": "Ubuntu:24.04:LTS", "name": "xx"},
                                              "ranges": [{"type": "GIT", "events": fixed("abc")}]}])])
         with open(os.path.join(osv, "modified_id.csv"), "w") as handle:
             handle.write("2027-01-01T00:00:00Z,UBUNTU-CVE-2026-0060\n")
-        with self.assertRaisesRegex(FeedError, "unknown range shapes"):
-            osvfeed.build_releases(os.path.join(self.tmp, "site", "v1"), helpers_log(),
-                                   os.path.join(self.tmp, "cache2"), os.path.join(self.tmp, "work"),
-                                   releases=[UBU], golden_dir=self.golden)
+        _, _, (releases, _, failures) = self.run_build(cache="cache2")
+        self.assertEqual(releases, {})
+        self.assertIn("unknown range shape", failures["ubuntu-24.04"])
+
+    def test_gates_fail_soft(self):
+        self.write_gates({"ubuntu-24.04": 5})
+        _, _, (releases, _, failures) = self.run_build()
+        self.assertIn("under the floor 5", failures["ubuntu-24.04"])
+        self.write_gates({"ubuntu-24.04": 1})
+        with open(os.path.join(self.golden, "inv.tsv"), "w") as handle:
+            handle.write("openssl\t3.0.13-0ubuntu3.6\n")   # no longer flags: the golden "exact" misses it
+        _, _, (releases, _, failures) = self.run_build()
+        self.assertIn("missing ['openssl']", failures["ubuntu-24.04"])
+
+    def test_unreachable_osv_fails_soft(self):
+        self.patch(netfetch, "OSV_BASE", "file://" + os.path.join(self.tmp, "nowhere"))
+        _, _, (releases, _, failures) = self.run_build(cache="cache3")
+        self.assertEqual(releases, {})
+        self.assertIn("osv Ubuntu", failures["ubuntu-24.04"])
+
+    def test_config_errors_still_raise(self):
+        with open(os.path.join(self.gates, "minimums.json"), "w") as handle:
+            handle.write("{")
+        with self.assertRaises(osvfeed.ConfigError):
+            self.run_build()
 
 
 def helpers_log():
