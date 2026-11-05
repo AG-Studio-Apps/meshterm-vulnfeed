@@ -80,5 +80,41 @@ class EVR(unittest.TestCase):
         self.assertIsNone(rpmver.upstream_major_minor("20240101-1.el9"))
 
 
+MODULE_MATCH = os.path.join(helpers.ROOT, "tests", "fixtures", "rpm-module-match.txt")
+
+
+def module_cases():
+    with open(MODULE_MATCH, encoding="utf-8") as handle:
+        return [tuple(line.split("\t")) for line in handle.read().splitlines() if line and not line.startswith("#")]
+
+
+class ModuleBuildTail(unittest.TestCase):
+    """Review M1: modular builds compare without their module build ids (Rocky's rebuild ids are its own)."""
+
+    def test_without_module_build(self):
+        strip = rpmver.without_module_build
+        self.assertEqual(strip("0:2.4.37-65.module+el8.10.0+40045+6ce8579b.6"), "0:2.4.37-65.module+el8.10.0.6")
+        self.assertEqual(strip("2.4.37-65.module+el8.10.0+40402+af9563a3"), "2.4.37-65.module+el8.10.0")
+        self.assertEqual(strip("8.1.32-1.module_el9.8.0+326+528679fc.alma.1"), "8.1.32-1.module_el9.8.0.alma.1")
+        self.assertEqual(strip("1:3.5.8-2.el9_8"), "1:3.5.8-2.el9_8")
+        self.assertEqual(strip("2.4.37"), "2.4.37", "no release")
+        self.assertEqual(strip("not an evr-a-b"), "not an evr-a-b")
+        self.assertEqual(strip("1-1.module+el8+1+abc"), "1-1.module+el8", "a major-only dist")
+
+    def test_shared_vectors(self):
+        got = module_cases()
+        self.assertEqual(len(got), 15)
+        for a, b, want in got:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(rpmver.match_compare(a, b), int(want))
+                self.assertEqual(rpmver.match_compare(b, a), -int(want))
+        with open(MODULE_MATCH, "rb") as handle:
+            self.assertEqual(hashlib.sha256(handle.read()).hexdigest(), MODULE_MATCH_SHA256,
+                             "the shared copy drifted (change meshTerm's in the same breath)")
+
+
+MODULE_MATCH_SHA256 = "5b74d12ab656268b3c4ce028feedfce19ca5d3f8b355df30cddbcc2a40d76fb7"
+
+
 if __name__ == "__main__":
     unittest.main()

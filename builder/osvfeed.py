@@ -55,9 +55,11 @@ Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differ
 EL (S5, format "rpm", keyed by BINARY rpm name: OSV's AlmaLinux and Red Hat records name binaries and no source
 rpm; README "AlmaLinux and RHEL") takes the Alpine pass with these differences: releases may MERGE several OSV
 ecosystems (RHEL's baseos, appstream, crb); only records naming an upstream CVE ship; debuginfo / debugsource and
-every kernel binary but kernel-core (and its rt / 64k / debug variants) are dropped; EVRs compare with
-builder/rpmver.py; severity is Alma's summary prefix or RHEL's CVSS; a modular fix carries the module streams
-named in its advisories' summaries; kernel rows keep the advisory date. The file is compact (release_body), and a
+every kernel binary but kernel-core (and its rt / 64k / debug variants), and the kernel source's userspace binaries
+(perf, bpftool ...), are dropped; EVRs compare with builder/rpmver.py (modular builds without their module build ids
+when matched); severity is the advisory's own rating (Alma's summary prefix, RHEL's classification reference; an
+unrated RHEL advisory's own CVSS); a modular fix carries the module streams named in its advisories' summaries;
+kernel rows keep the advisory date. The file is compact (release_body), and a
 file over FILE_CAP keeps fewer superseded fixes per binary (prune_superseded).
 """
 import collections
@@ -103,6 +105,7 @@ REJECT_LIMIT = 0.005        # rejected fixed versions, per OSV ecosystem, as a s
 # 17,856 rows on 2026-11-05) is normalised to the dotted form aports uses and is only counted.
 INTRODUCED_REJECT_LIMIT = 0.02
 ROW_SWING = 0.30            # per-release row count change allowed against the previous build
+CAP_HEADROOM_WARN = 0.05    # a release file within 5% of FILE_CAP warns in the build record (review L1)
 ROW_SWING_FLOOR = 25        # ... or this many rows, whichever is larger (small files swing by single rows)
 HIGH = cvss.HIGH
 
@@ -179,7 +182,7 @@ RELEASES = [
     Release("alpine-3.23", "alpine", "Alpine:v3.23", None),
     Release("alpine-3.24", "alpine", "Alpine:v3.24", None),
     # S5 (plan 3.4, D7). AlmaLinux from its own OSV data (binary rpm names, the summary-prefix severity). RHEL from
-    # Red Hat's OSV data (binary rpm names, CVSS), one file per major merging the repositories every subscription
+    # Red Hat's OSV data (binary rpm names, each advisory's Red Hat rating), one file per major merging the repositories every subscription
     # has (baseos, appstream, crb; RHEL 10 publishes per minor release instead, 10.0, 10.1 ...: all merged); EUS /
     # AUS / E4S / TUS streams and the add-on repositories are left out. Rocky Linux hosts use the RHEL file (Rocky's
     # own OSV data is incomplete: `Rocky Linux:9` has no openssl-libs at all).
@@ -230,9 +233,17 @@ def is_kernel(source, fmt="dpkg"):
     return (source == "linux" or source.startswith("linux-")) and not _NON_KERNEL.match(source)
 
 
+# EL userspace binaries built from the KERNEL source rpm (review L2): perf, bpftool, rtla ... Their fixes are the
+# kernel advisory's (RHSA "kernel security update" names them beside kernel-core), so like the kernel's other
+# binaries they never ship as ordinary rows: a host would otherwise list the kernel's CVEs under "perf".
+RPM_KERNEL_USERSPACE = frozenset({"perf", "python3-perf", "python-perf", "bpftool", "rtla", "rv", "libperf",
+                                  "libperf-devel"})
+
+
 def is_rpm_kernel_family(name):
-    """A binary of the EL kernel source (`kernel`, `kernel-*`): only RPM_KERNELS ship, as kernel rows."""
-    return name == "kernel" or name.startswith("kernel-")
+    """A binary of the EL kernel source (`kernel`, `kernel-*`, and the userspace tools it builds): only RPM_KERNELS
+    ship, as kernel rows."""
+    return name == "kernel" or name.startswith("kernel-") or name in RPM_KERNEL_USERSPACE
 
 
 def name_ok(source, fmt="dpkg"):
@@ -470,6 +481,28 @@ def module_streams(summary):
     return sorted({m.group(1).rstrip(".") for m in _STREAM.finditer(summary)})
 
 
+# RHEL severity (review H1): each Red Hat advisory's own rating, the `#important` anchor of its classification link
+# (https://access.redhat.com/security/updates/classification/#important; www.redhat.com on old advisories). It rates
+# every id the advisory fixes FOR THAT PRODUCT. The zip-wide CVSS of an id is the worst score any Red Hat product's
+# advisory gave it (OpenShift, RHEL 7 ...), not the RHEL rating: on the 2026-11-05 zip it made 416 of 847 RHEL-9
+# Moderate advisories ship as High or Critical, and 18 Important ones as Medium.
+_RH_RATING = re.compile(r"(?:access|www)\.redhat\.com/security/updates/classification/?#(critical|important|moderate|low)"
+                        r"(?![a-z])", re.IGNORECASE)
+
+
+def redhat_rating_band(record):
+    """The band of a Red Hat record's own severity rating (its classification reference), or None when it has none
+    (a bare classification link, 46 RHEL-9 advisories on 2026-11-05). Two different ratings (2 advisories): the
+    higher."""
+    best = None
+    for ref in record.get("references") or []:
+        url = ref.get("url") if isinstance(ref, dict) else None
+        match = _RH_RATING.search(url) if isinstance(url, str) else None
+        if match:
+            best = _max_none(best, _ALMA_PREFIX[match.group(1).lower()])
+    return best
+
+
 def alma_prefix_band(summary):
     """The band of an AlmaLinux summary's severity prefix, or None."""
     if not isinstance(summary, str) or ":" not in summary:
@@ -479,7 +512,7 @@ def alma_prefix_band(summary):
 
 class Candidate:
     __slots__ = ("ids", "advisory", "advisory_ids", "pkg_priority", "adv_date", "rec_date", "modified", "tokens",
-                 "prefix", "streams")
+                 "prefix", "streams", "own_cvss")
 
     def __init__(self):
         self.ids = set()
@@ -490,7 +523,9 @@ class Candidate:
         self.rec_date = None     # earliest `published` of any record naming it (fallback)
         self.modified = None     # newest `modified` of the records naming it
         self.tokens = set()
-        self.prefix = {}            # EL (Alma): id -> the highest summary-prefix band of the records naming it
+        self.prefix = {}            # EL: id -> the highest advisory rating of the records naming it (Alma: the
+        #                             summary prefix; RHEL: the classification reference)
+        self.own_cvss = {}          # RHEL: id -> the highest CVSS of the naming records that carry NO rating
         self.streams = set()        # EL: the module streams (`php:8.1`) of the records naming a modular fix
 
 
@@ -544,7 +579,9 @@ def ingest(zip_path, releases, log):
                 info[rid] = sev
             published, modified_date = _date(record.get("published")), _date(modified)
             summary = record.get("summary")
-            prefix_band = alma_prefix_band(summary)
+            alma_band = alma_prefix_band(summary)
+            # RHEL rates by the advisory's own Red Hat rating, its own CVSS only when it has none (review H1).
+            rh_band = redhat_rating_band(record)
             streams = module_streams(summary)
             for affected in record.get("affected") or []:
                 package = affected.get("package") or {}
@@ -563,7 +600,9 @@ def ingest(zip_path, releases, log):
                         stats[f"{release.key}: debuginfo / debugsource (dropped)"] += 1
                         continue
                     if isinstance(source, str) and is_rpm_kernel_family(source) and source not in RPM_KERNELS:
-                        stats[f"{release.key}: kernel binary other than kernel-core (dropped)"] += 1
+                        stats[f"{release.key}: " + ("kernel userspace binary (perf, bpftool ...) (dropped)"
+                                                    if source in RPM_KERNEL_USERSPACE else
+                                                    "kernel binary other than kernel-core (dropped)")] += 1
                         continue
                 try:
                     dropped = collections.Counter()
@@ -610,9 +649,14 @@ def ingest(zip_path, releases, log):
                         for cve in ids:
                             cand.pkg_priority[cve] = max(pkg_priority, cand.pkg_priority.get(cve, -1))
                     if release.format == "rpm":
-                        if prefix_band is not None:
+                        band = rh_band if release.family == "rhel" else alma_band
+                        rated_cvss = sev[1] if release.family == "rhel" and band is None else None
+                        if band is not None:
                             for cve in ids:
-                                cand.prefix[cve] = max(prefix_band, cand.prefix.get(cve, -1))
+                                cand.prefix[cve] = max(band, cand.prefix.get(cve, -1))
+                        elif rated_cvss is not None:
+                            for cve in ids:
+                                cand.own_cvss[cve] = _max_none(cand.own_cvss.get(cve), rated_cvss)
                         if rpmver.is_modular(fixed):
                             cand.streams.update(streams)
                             if not streams:
@@ -967,8 +1011,8 @@ def resolve_apk(release, cands, info, counters, decisions):
 
 
 def resolve_rpm(release, cands, info, counters, decisions):
-    """Rules for one EL release (S5): reject bad versions, severity (Alma: the summary prefix; RHEL: CVSS; else
-    Medium), the kernel fold (kernel-core and its variants, with the advisory's date), module streams merged per
+    """Rules for one EL release (S5): reject bad versions, severity (Alma: the summary prefix; RHEL: the advisory's
+    Red Hat rating, else its own CVSS; else Medium), the kernel fold (kernel-core and its variants, with the advisory's date), module streams merged per
     (binary, introduced, fixed) across every advisory naming it. Same return shape as resolve()."""
     rows, examples, dropped = [], [], []
     for (source, introduced, fixed), cand in sorted(cands.items()):
@@ -1031,9 +1075,17 @@ def severity(release, cve, cand, info):
         if cve in cand.prefix:
             return cand.prefix[cve], "alma summary prefix"
         return cvss.MEDIUM, "default medium"
+    if release.family == "rhel":
+        # Never the zip-wide `info` (every Red Hat product's worst score): the advisory's own rating, else the
+        # CVSS of the advisory that names the fix, else Medium (review H1).
+        if cve in cand.prefix:
+            return cand.prefix[cve], "red hat rating"
+        if cve in cand.own_cvss:
+            return cvss.band(cand.own_cvss[cve]), "advisory cvss (no rating)"
+        return cvss.MEDIUM, "default medium"
     if score is not None:
         return cvss.band(score), "cvss"
-    if release.family in ("alpine", "rhel"):
+    if release.family == "alpine":
         return cvss.MEDIUM, "default medium"
     if cve in cand.advisory_ids:
         return HIGH, "dsa/dla exists -> high"
@@ -1229,7 +1281,7 @@ def _check_rpm_tables(body, fail):
         fail("an id no fix names")
     count, used_fixes = 0, set()
     for name, refs in pkgs.items():
-        if not name_ok(name, "rpm") or is_kernel(name, "rpm"):
+        if not name_ok(name, "rpm") or is_rpm_kernel_family(name):
             fail(f"bad pkgs binary {name!r}")
         if not isinstance(refs, list) or not refs or refs != sorted(set(refs)) \
                 or not all(type(r) is int and 0 <= r < len(fixes) for r in refs):
@@ -1381,9 +1433,10 @@ def rpm_hits(rows, inventory, capture):
         installed, group, label = entry
         if not rpm_stream_ok(row["fixed"], row.get("streams") or [], installed, label):
             continue
-        if row["introduced"] != "0" and rpmver.compare(installed, row["introduced"]) < 0:
+        # Review M1: modular builds compare without their module build ids (Rocky's own), as the app does.
+        if row["introduced"] != "0" and rpmver.match_compare(installed, row["introduced"]) < 0:
             continue
-        if rpmver.compare(installed, row["fixed"]) < 0:
+        if rpmver.match_compare(installed, row["fixed"]) < 0:
             hits[group].append(row["fixed"])
     return dict(hits)
 
@@ -1783,6 +1836,12 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
             if problems:
                 fail([key], "; ".join(problems))
                 continue
+            headroom = 1 - len(built["data"]) / FILE_CAP
+            if headroom < CAP_HEADROOM_WARN:
+                # Review L1: the next few hundred rows would push it over (and an rpm file into the fit-to-cap
+                # prune); worth a look before it fails.
+                log.warn(f"{key}: {len(built['data'])} bytes, {headroom:.1%} under the {FILE_CAP}-byte cap "
+                         f"(warns below {CAP_HEADROOM_WARN:.0%})")
             with open(os.path.join(site_v1, entry["file"]), "wb") as handle:
                 handle.write(built["data"])
             out[key] = entry

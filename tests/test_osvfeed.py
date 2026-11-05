@@ -383,6 +383,7 @@ class Golden(unittest.TestCase):
                           "alpine-3.20-stock.apk.txt", "alpine-3.20.0-20240522.apk.txt",
                           "alpine-3.24-stock.apk.txt", "almalinux-9-stock.rpm.tsv", "almalinux-9.2-20230718.rpm.tsv",
                           "rockylinux-9.3-20231128.rpm.tsv", "rockylinux-9-resf-stock.rpm.tsv",
+                          "rockylinux-8-modules-current.rpm.tsv", "rockylinux-8-httpd-behind.rpm.tsv",
                           "synthetic-alma-9-php82-module-current.rpm.tsv",
                           "synthetic-alma-9-php82-module-behind.rpm.tsv"})
         for case in cases:

@@ -60,7 +60,9 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
   the fixed `sources` shape; every named file present and matching its sha256; every release file's schema;
   every file under 600 KB; no unexpected file, no symlink; the curated file re-validates. The sign job repeats the
   format ties inline: an `alpine-*` entry must be `apk`, every other `dpkg`; each release body's `format` must
-  equal its entry's; `sources.archive` may be empty only when every release is an Alpine one.
+  equal its entry's; `sources.archive` may be empty only when every release is an Alpine one. For an rpm body it
+  also checks the compact tables hold together (review L7): `ids` sorted unique CVEs, every fix 5 fields with sorted,
+  unique, in-range id indexes, every binary's fix indexes the same, and no id or fix that nothing refers to.
 
 ## Release files (`v1/r/`)
 
@@ -157,6 +159,15 @@ repositories only. **Rocky Linux hosts use the RHEL file**: Rocky's own OSV data
 no openssl-libs), and Rocky rebuilds RHEL's sources at the same NEVRA (a Rocky-only `.rocky.0.1` rebuild sorts below
 RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
 
+- **Fixes that may lag (review L3).** Two cases flag a package the host cannot update yet. A **Rocky host** is
+  matched against Red Hat's fixes, and Rocky ships each one days to weeks later: on 2026-11-05 RESF's 9.8 image was
+  flagged for libcap `2.48-10.el9_8.1` (Red Hat, Important) while Rocky's baseos still had only `2.48-10.el9_7.1`.
+  An **EUS / AUS host** (pinned to a minor release) is matched against the main repositories, whose fixes are built for
+  the newest minor (`.el9_8`); its own EUS build (`.el9_6.4`) can sort below that and stay flagged. Neither is a
+  wrong finding (the CVE is fixed upstream and the host lacks it), but Install Updates may install nothing. The app's
+  Security updates sheet says so for every rpm host ("Some fixes may not be available from your vendor yet."); the
+  finding clears at the first check after the vendor ships it.
+
 - **Keyed by BINARY rpm name**: OSV's EL records name binaries (`openssl`, `openssl-libs`, `openssl-devel`) and no
   source rpm, so the file is COMPACT: a sorted CVE table, a fix table sorted by fixed EVR (`[introduced, fixed,
   severity, [id index ...], [module stream ...]]`) and per binary the indexes of its fixes. The row count is the
@@ -166,24 +177,47 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
   binaries are dropped; of the kernel's binaries only `kernel-core` and its variants (`kernel-rt-core`,
   `kernel-64k-core`, `kernel-debug-core` ...) ship, as kernel rows dated by their advisory (the app matches
   `kernel-core-$(uname -r)` only); `kernel`, `kernel-modules*`, `kernel-tools*`, `kernel-headers` are dropped and
-  counted.
-- **Severity**: AlmaLinux publishes no score, so its summary prefix (`Critical:` 4, `Important:` 3, `Moderate:`,
-  `Low:`) rates every id of the advisory; RHEL: the highest CVSS 3.x score of the advisories naming the id. Else
-  Medium (not shipped).
+  counted, and so are the userspace binaries the kernel source builds (`perf`, `python3-perf`, `bpftool`, `rtla`,
+  `rv`, `libperf`, review L2: their fix is the kernel advisory, so they would list the kernel's CVEs as a package).
+- **Severity**: the advisory's own Red Hat rating, for every id it fixes. AlmaLinux: its summary prefix
+  (`Critical:` 4, `Important:` 3, `Moderate:`, `Low:`). RHEL (review H1): the anchor of the advisory's classification
+  reference (`https://access.redhat.com/security/updates/classification/#important`), stored per (binary, fix) like
+  Alma's prefix; only an advisory with no rating (a bare classification link, 46 on RHEL 9) falls back to ITS OWN
+  CVSS, else Medium (not shipped). Never the zip-wide CVSS of an id: that is the worst score ANY Red Hat product's
+  advisory gave it (OpenShift, RHEL 7 ...). On the 2026-11-05 zip it shipped 619 of 846 RHEL 9 Moderate advisories and
+  27 of 70 Low ones as High or Critical, and 10 Important ones as Medium; rated by Red Hat, RHEL and Alma now agree
+  (rockylinux:9.3 and almalinux:9.2 flag the same 22 source rpms).
 - **Module streams**: a modular fix (`.module_el9...`, Red Hat's `.module+el9...`) carries the `name:stream` tokens
   of its advisories' summaries (`php:8.1`; `virt:rhel` and `virt-devel:rhel` for a two-module advisory), merged over
   every advisory naming that (binary, fix). The app compares a modular row only with a modular build of the same
   stream (the host's MODULARITYLABEL), a plain row only with a plain build; with no label or no stream it needs the
   same upstream major.minor. So a php:8.2 host never meets a php:8.1 or php:8.3 row.
+- **Module build ids are ignored (review M1).** A modular release is `<n>.module+el8.10.0+<build id>+<context>.<z>`;
+  the build id is the builder's counter, not the package's. Rocky rebuilds Red Hat's httpd:2.4 specs with its own ids:
+  `+1842+4a9649e8.2` .. `+2061+8d03fdec.5` (below Red Hat's `+22196+d82931da.2`), then `+40045+6ce8579b.6` ..
+  `+40402+af9563a3.13` (above Red Hat's `+24521+219dcfc5.9`; rockylinux/rockylinux:8, 2026-11-05). Compared as is,
+  an up-to-date low-id build looks behind forever and a stale high-id one (`.6` against Red Hat's `.9`) is never
+  flagged. Two modular builds therefore compare without `+<build id>+<context>` (`rpmver.match_compare`, meshTerm's
+  `RpmVersion.matchCompare`, shared vectors `tests/fixtures/rpm-module-match.txt`): version, the release up to and
+  including `module+elX.Y.Z`, then the `.z` counter, which the spec carries across rebuilds. Measured: no false
+  positive was live on 2026-11-05 (Rocky's current ids are all above Red Hat's), but the `.6` false negative was.
 - **No archive, no baseline, no published check** (as Alpine): the repositories' metadata are not fetched. The
   golden images were checked by hand instead: every binary they flag had a candidate at or above the fix in the
-  image's own repositories (`dnf repoquery`, 2026-11-05).
-- **Fit to the cap**: a file over 600 KB (only rhel-8 today, 850 KB) keeps the newest N fixes per (binary, module
-  stream), the largest N of 16, 12, 10, 8, 6, 5, 4, 3 that fits (rhel-8: 6, 8,414 rows). A host below an older fix is
-  below every newer one, so no finding is lost; it lists fewer CVEs and can show a lower severity. Logged and counted.
+  image's own repositories (`dnf repoquery`, 2026-11-05), except Rocky's libcap above (the vendor lag).
+- **Dates**: a row's date is the earliest `published` of the records naming it. Red Hat's `published` is often the
+  day its records were CONVERTED to OSV, not the advisory's (RHSA-2003:315 says 2024-09-12), so it is good for the
+  "fix older than 7 days" kernel rule and for "before the capture" on a capture-day golden, but never for a backdated
+  golden (a `capture` in the past would silently drop every old advisory converted later; review L6).
+- **Fit to the cap**: a file over 600 KB keeps the newest N fixes per (binary, module stream), the largest N of 16,
+  12, 10, 8, 6, 5, 4, 3 that fits. A host below an older fix is below every newer one, so no finding is lost; it lists
+  fewer CVEs and can show a lower severity. Logged and counted. None needs it since review H1: rhel-8 was 850 KB with
+  the zip-wide CVSS (pruned to 6 per binary), and is 486 KB (21% under the cap) rated by Red Hat. Any release file
+  within 5% of the cap warns in the build record (`CAP_HEADROOM_WARN`, review L1).
 - **Golden cases** (`builder/golden/*.rpm.tsv`): the app's Pro probe rpm listing from stock `almalinux:9` (9.8, the
   EL false-positive gate: `exact: []`), `almalinux:9.2` (July 2023), `rockylinux:9` (the library image, 9.3) and
-  `rockylinux/rockylinux:9` (9.8, months behind) against rhel-9, plus two SYNTHETIC php:8.2 module listings for the
+  `rockylinux/rockylinux:9` (9.8, months behind) against rhel-9; `rockylinux/rockylinux:8` (8.10) upgraded with the
+  httpd:2.4 and nodejs:20 modules installed (`exact: []` on rhel-8, the Rocky module gate) and with httpd pinned at
+  Rocky's `+40045+6ce8579b.6` (`exact: [httpd]`); plus two SYNTHETIC php:8.2 module listings for the
   stream rule. Rows dated before the capture count, so the frozen images never drift; 3 or more unexpected
   source rpms fail.
 

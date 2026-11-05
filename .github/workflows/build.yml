@@ -328,6 +328,28 @@ jobs:
                   problems.append(f"release {key}: {name} does not name its release"); continue
               if body.get("format") != e["format"]:
                   problems.append(f"release {key}: {name} says format {body.get('format')!r}, the manifest {e['format']!r}"); continue
+              if fmt_of(key) == "rpm":
+                  # S5 review L7: the compact tables must hold together (the app follows these indexes): ids sorted
+                  # unique CVEs; every fix 5 fields whose id indexes are sorted, unique and in range; every binary's
+                  # fix indexes the same; no id and no fix that nothing refers to.
+                  ids_t, fixes_t, pk = body["ids"], body["fixes"], body["pkgs"]
+                  def refs_ok(refs, n):
+                      return isinstance(refs, list) and len(refs) > 0 and refs == sorted(set(refs)) \
+                          and all(type(r) is int and 0 <= r < n for r in refs)
+                  bad = None
+                  if not isinstance(ids_t, list) or ids_t != sorted(set(ids_t)) \
+                          or not all(isinstance(i, str) and re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", i) for i in ids_t):
+                      bad = "ids table"
+                  elif not isinstance(fixes_t, list) \
+                          or not all(isinstance(f, list) and len(f) == 5 and refs_ok(f[3], len(ids_t)) for f in fixes_t):
+                      bad = "fixes table"
+                  elif not isinstance(pk, dict) or not all(refs_ok(v, len(fixes_t)) for v in pk.values()):
+                      bad = "pkgs fix indexes"
+                  elif {r for f in fixes_t for r in f[3]} != set(range(len(ids_t))) \
+                          or {r for v in pk.values() for r in v} != set(range(len(fixes_t))):
+                      bad = "table (an id or a fix nothing refers to)"
+                  if bad:
+                      problems.append(f"release {key}: {name} has a bad rpm {bad}"); continue
               try:
                   count = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
               except (AttributeError, TypeError):

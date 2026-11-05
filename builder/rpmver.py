@@ -135,6 +135,34 @@ def is_modular(text):
     return bool(_MODULAR.search(text or ""))
 
 
+# The build tail of a modular release (review M1): `module+el8.10.0` (Red Hat, Rocky) or `module_el9.8.0` (Alma),
+# then `+<module build id>+<context>`. The id is the BUILDER's counter, not the package's: Red Hat's httpd:2.4 on 8.10
+# is `+22196+d82931da.2` .. `+24521+219dcfc5.9`, Rocky's rebuilds of the same specs `+1842+4a9649e8.2` ..
+# `+2061+8d03fdec.5`, then `+40045+6ce8579b.6` .. `+40402+af9563a3.13` (rockylinux/rockylinux:8, 2026-11-05). The z-stream
+# counter after the context (`.9`) is the spec's own and matches across rebuilds.
+_MODULE_BUILD_TAIL = re.compile(r"(module[_+]el\d+(?:\.\d+)*)\+\d+\+[A-Za-z0-9]+")
+
+
+def without_module_build(text):
+    """`2.4.37-65.module+el8.10.0+40045+6ce8579b.6` -> `2.4.37-65.module+el8.10.0.6`: the EVR with the first
+    `+<build id>+<context>` after `module[_+]elX.Y.Z` taken out of the release; any other EVR unchanged."""
+    parsed = parse(text)
+    if parsed is None or parsed[2] is None:
+        return text
+    head = text[:len(text) - len(parsed[2])]
+    return head + _MODULE_BUILD_TAIL.sub(r"\1", parsed[2], count=1)
+
+
+def match_compare(a, b):
+    """The comparison the matcher uses (meshTerm's RpmVersion.matchCompare is the twin): `compare`, except that two
+    MODULAR builds compare without their module build tails (`without_module_build`), so a rebuild's own build ids
+    (Rocky's +40045 against Red Hat's +24521) never decide the order: version, then the release up to and including
+    `module+elX.Y.Z`, then what follows the context."""
+    if is_modular(a) and is_modular(b):
+        return compare(without_module_build(a), without_module_build(b))
+    return compare(a, b)
+
+
 def upstream_major_minor(text):
     """The first two numeric components of the version (`8.1.14` -> (8, 1)), or None."""
     parsed = parse(text)

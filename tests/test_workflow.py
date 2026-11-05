@@ -356,6 +356,53 @@ class SignJobRpm(SignJobFormats):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not name its release", result.stdout)
 
+    def rewrite_body(self, change):
+        """Applies `change` to the alma-9 body and re-pins its file name, sha256 and bytes in the manifest."""
+        import hashlib
+        entry = self.manifest["releases"]["alma-9"]
+        path = os.path.join(self.out, "v1", entry["file"])
+        with open(path, "rb") as handle:
+            body = json.loads(handle.read())
+        os.remove(path)
+        change(body)
+        data = osvfeed.body_bytes(body)
+        sha = hashlib.sha256(data).hexdigest()
+        name = f"r/alma-9-{sha[:16]}.json"
+        with open(os.path.join(self.out, "v1", name), "wb") as handle:
+            handle.write(data)
+        try:
+            rows = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
+        except (AttributeError, TypeError):
+            rows = entry["rows"]
+        self.edit_manifest(lambda m: m["releases"]["alma-9"].update(file=name, sha256=sha, bytes=len(data), rows=rows))
+
+    def test_rpm_index_integrity(self):
+        # L7: the compact tables' indexes, checked inline (the build job's check_release_body did the full schema).
+        cases = [
+            (lambda b: b["pkgs"].update({"openssl-libs": [1]}), "has a bad rpm pkgs fix indexes"),     # out of range
+            (lambda b: b["pkgs"].update({"openssl-libs": []}), "has a bad rpm pkgs fix indexes"),
+            (lambda b: b["pkgs"].update({"openssl-libs": ["0"]}), "has a bad rpm pkgs fix indexes"),
+            (lambda b: b["pkgs"].update({"openssl-libs": [0, 0]}), "has a bad rpm pkgs fix indexes"),
+            (lambda b: b["fixes"][0][3].append(5), "has a bad rpm fixes table"),
+            (lambda b: b["fixes"][0].pop(), "has a bad rpm fixes table"),
+            (lambda b: b["fixes"].append(["0", "1:9-1.el9", 3, [0], []]),
+             "has a bad rpm table (an id or a fix nothing refers to)"),
+            (lambda b: b["ids"].append("CVE-2026-19999"), "has a bad rpm table (an id or a fix nothing refers to)"),
+            (lambda b: b["ids"].insert(0, "RHSA-2026:1"), "has a bad rpm ids table"),
+            (lambda b: b.update(ids={"CVE-2026-10001": 0}), "has a bad rpm ids table"),
+        ]
+        for change, why in cases:
+            with self.subTest(why=why):
+                self.setUp()
+                self.rewrite_body(change)
+                result = self.run_check()
+                self.assertNotEqual(result.returncode, 0, why)
+                self.assertIn(why, result.stdout)
+        self.setUp()
+        self.rewrite_body(lambda b: None)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_rhel_keys_are_rpm(self):
         text = sign_check_script()
         namespace = {}
