@@ -555,7 +555,7 @@ class EndToEnd(unittest.TestCase):
         self.patch(osvfeed, "UBUNTU_MIRROR", "file://" + self.mirror)
         self.patch(netfetch, "OSV_BASE", "file://" + os.path.join(self.tmp, "osv"))
 
-    def write_suite(self, suite, sources, sign=True):
+    def write_suite(self, suite, sources, sign=True, extra=""):
         directory = os.path.join(self.mirror, "dists", suite, "main", "source")
         os.makedirs(directory, exist_ok=True)
         data = lzma.compress(sources.encode())
@@ -564,7 +564,7 @@ class EndToEnd(unittest.TestCase):
         digest = netfetch.hashlib.sha256(data).hexdigest()
         release = os.path.join(self.mirror, "dists", suite, "Release")
         with open(release, "w") as handle:
-            handle.write(f"Suite: {suite}\nDate: Thu, 25 Apr 2024 15:10:33 UTC\nSHA256:\n"
+            handle.write(f"Suite: {suite}\nDate: Thu, 25 Apr 2024 15:10:33 UTC\n{extra}SHA256:\n"
                          f" {digest} {len(data)} main/source/Sources.xz\n")
         inrelease = os.path.join(self.mirror, "dists", suite, "InRelease")
         if sign:
@@ -583,12 +583,13 @@ class EndToEnd(unittest.TestCase):
         setattr(module, name, value)
         self.addCleanup(setattr, module, name, old)
 
-    def run_build(self, previous=None, cache="cache", log=None):
+    def run_build(self, previous=None, cache="cache", log=None, now=None, previous_dates=None):
         site = os.path.join(self.tmp, "site", "v1")
         log = log or helpers_log()
         result = osvfeed.build_releases(site, log, os.path.join(self.tmp, cache), os.path.join(self.tmp, "work"),
                                         previous=previous, releases=[UBU], golden_dir=self.golden,
-                                        gates_dir=self.gates, today="2026-11-05")
+                                        gates_dir=self.gates, today="2026-11-05", now=now,
+                                        previous_dates=previous_dates)
         return site, log, result
 
     def test_build(self):
@@ -622,6 +623,29 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(releases, {})
         self.assertIn("no valid signature", failures["ubuntu-24.04"])
         self.assertIn("ubuntu-24.04-esm", osvfeed.RELEASE_KEYS)
+
+    def test_valid_until_enforced(self):
+        sources = "Package: linux-gcp\nVersion: 6.8.0-1020.21\n"
+        self.write_suite("noble-security", sources, extra="Valid-Until: Thu, 12 Nov 2026 15:10:33 UTC\n")
+        _, _, (releases, _, failures) = self.run_build(now="2026-11-05T17:10:00Z")
+        self.assertEqual(failures, {})
+        _, _, (releases, _, failures) = self.run_build(now="2026-11-13T05:10:00Z")
+        self.assertEqual(releases, {})
+        self.assertIn("noble-security: InRelease expired (Valid-Until 2026-11-12T15:10:33Z", failures["ubuntu-24.04"])
+        # No `now` (the snapshot tools): not checked.
+        _, _, (_, _, failures) = self.run_build()
+        self.assertEqual(failures, {})
+
+    def test_date_must_not_go_backwards(self):
+        same = {"noble": "2024-04-25T15:10:33Z"}
+        _, _, (_, sources, failures) = self.run_build(previous_dates=same)
+        self.assertEqual(failures, {})
+        self.assertEqual(sources["archive"]["noble"], "2024-04-25T15:10:33Z")
+        newer = {"noble": "2024-04-26T00:00:00Z"}
+        _, _, (releases, _, failures) = self.run_build(previous_dates=newer)
+        self.assertEqual(releases, {})
+        self.assertIn("noble: InRelease Date 2024-04-25T15:10:33Z is older than the 2024-04-26T00:00:00Z",
+                      failures["ubuntu-24.04"])
 
     def test_tampered_sources_fails_soft(self):
         path = os.path.join(self.mirror, "dists", "noble", "main", "source", "Sources.xz")

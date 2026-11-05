@@ -338,6 +338,24 @@ class FailSoftTests(unittest.TestCase):
             self.assertEqual(manifest["releases"], good["releases"], n)
             build.gate(self.out, build.Log(echo=False))
 
+    def test_inrelease_dates_recorded_as_a_high_water(self):
+        _, record, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
+        self.assertEqual(record["inrelease"], helpers.FAKE_SOURCES["archive"])
+        seen = []
+
+        def older(site_v1, log, previous, today):
+            seen.append(previous)
+            return {}, {"osv": {}, "archive": {"bookworm": "2026-07-01T00:00:00Z",
+                                               "trixie": "2026-09-12T07:55:41Z"}, "baseline": {}}, \
+                {"debian-12": "archive: replay"}
+        _, record, _ = self.build(build.ReleaseOptions(builder=older), "2026-11-05T17:10:00Z")
+        self.assertEqual(record["inrelease"], {"bookworm": "2026-07-11T10:16:37Z",
+                                               "bookworm-security": "2026-11-05T14:52:30Z",
+                                               "trixie": "2026-09-12T07:55:41Z"})
+        self.assertEqual(build.inrelease_dates([(2, record)]), record["inrelease"])
+        self.assertEqual(build.inrelease_dates([(1, {"manifest": {"sources": {"archive": {"noble": "x"}}}})]),
+                         {"noble": "x"}, "an older record: its manifest's sources.archive")
+
     def test_whole_s2_failure_still_publishes_curated(self):
         good, _, _ = self.build(helpers.fake_releases(), "2026-11-05T05:10:00Z")
 

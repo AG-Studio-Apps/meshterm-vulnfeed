@@ -107,7 +107,11 @@ The rules (plan section 3), in order, with every count in the build log:
 6. **Published check**: the highest version across every pocket (`<codename>`, `-updates`, `-security`) and
    component must be >= fixed. ESM rows skip it (the ESM archive needs a subscription token). Each suite's
    `InRelease` must carry at least one valid signature from the distro keyring pinned in `keys/archive/`, and no
-   bad one (checked with `gpgv`, apt's rule), before any of its Sources digests is trusted. An archive version
+   bad one (checked with `gpgv`, apt's rule), before any of its Sources digests is trusted. Replays are refused
+   two ways: an expired `Valid-Until` (Debian -security and -updates carry one) fails the release, and so does
+   a `Date` older than the one recorded for that suite (the build record's `inrelease`, a per-suite high-water
+   that never goes down; Ubuntu's pockets have no Valid-Until, so this is their defence). A failed release is
+   carried forward (fail-soft). An archive version
    our strict parser refuses is skipped and counted.
 7. Severity per CVE: the package's own Ubuntu priority, else the record's, else CVSS 3.x/4.0, else Medium
    (Ubuntu); CVSS, else High when a DSA/DLA naming that CVE ships the fix, else Medium (Debian). Only High and
@@ -246,6 +250,4 @@ UTC.
 
 - S4 (Alpine) and S5 (rpm) release files; the next Ubuntu interim (27.04) in `RELEASES` and the sign job's
   allowlist when it ships.
-- InRelease `Valid-Until` is not enforced (snapshot files are long expired): a replayed old, validly signed
-  InRelease could make fresh fixes look unpublished until the next build. The row-count gates bound the damage.
 - An emergency publish path in the workflow (a committed `manifest.json.minisig` mode, as in meshterm-recipes).

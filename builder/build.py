@@ -72,7 +72,7 @@ class ReleaseOptions:
         self.cache, self.work, self.offline, self.builder = cache, work, offline, builder
 
 
-def build_releases(site_v1, log, options, previous, today):
+def build_releases(site_v1, log, options, previous, today, now=None, previous_dates=None):
     """The OSV builder (builder/osvfeed.py). Returns (releases, sources, failures {release: reason}).
 
     S2 is FAIL-SOFT: a failing release is reported in `failures` (and carried forward by the caller), and if
@@ -82,12 +82,35 @@ def build_releases(site_v1, log, options, previous, today):
         if options.builder is not None:
             return options.builder(site_v1, log, previous, today)
         return osvfeed.build_releases(site_v1, log, options.cache, options.work, previous=previous,
-                                      offline=options.offline, today=today)
+                                      offline=options.offline, today=today, now=now,
+                                      previous_dates=previous_dates)
     except osvfeed.ConfigError:
         raise
     except Exception as error:  # noqa: BLE001 - fail-soft by design: the curated feed must still publish
         log.warn(f"S2 failed entirely ({type(error).__name__}: {error}); every release is carried forward")
         return {}, {}, {key: f"S2 failed: {error}"[:300] for key in osvfeed.RELEASE_KEYS}
+
+
+def inrelease_dates(past):
+    """{suite: InRelease Date} high-water from the newest build record (its `inrelease`, else, for a record
+    from before this field, its manifest's sources.archive)."""
+    if not past:
+        return {}
+    record = past[0][1]
+    dates = record.get("inrelease")
+    if dates is None:
+        dates = ((record.get("manifest") or {}).get("sources") or {}).get("archive") or {}
+    return {k: v for k, v in dates.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def merge_dates(previous, seen):
+    """The per-suite Date high-water to record: never lower than a previous build's (a failed or replayed suite
+    keeps the newest Date ever verified)."""
+    out = dict(previous or {})
+    for suite, date in (seen or {}).items():
+        if suite not in out or date > out[suite]:
+            out[suite] = date
+    return dict(sorted(out.items()))
 
 
 def carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log):
@@ -385,7 +408,9 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
     for _, record in past:
         previous = (record.get("manifest") or {}).get("releases") or None
         break
-    releases, sources, failures = build_releases(site_v1, log, options, previous, now[:10])
+    previous_dates = inrelease_dates(past)
+    releases, sources, failures = build_releases(site_v1, log, options, previous, now[:10], now, previous_dates)
+    seen_dates = dict(sources.get("archive") or {})
     stale = carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log)
     if not releases:
         sources = {}
@@ -410,6 +435,7 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
         "manifest": manifest,
         "carried": carried,
         "stale": stale,
+        "inrelease": merge_dates(previous_dates, seen_dates),
         "log": log.lines,
         "warnings": log.warnings,
     }

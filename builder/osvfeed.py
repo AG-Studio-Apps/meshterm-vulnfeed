@@ -455,9 +455,28 @@ def verify_inrelease(data, keyring):
             return handle.read()
 
 
-def load_suite(cache, mirror, suite, used, log, offline=False, family=None, skipped=None):
+def release_field(body, name):
+    match = re.search(rf"^{name}: *(.+)$", body.decode("utf-8", "replace"), re.M)
+    return match.group(1).strip() if match else None
+
+
+def check_freshness(suite, body, date, now, previous_date):
+    """Replay defence for a verified InRelease: an expired `Valid-Until` (Debian -security and -updates carry
+    one) fails, and so does a `Date` older than the one a previous build recorded for this suite (Ubuntu's
+    pockets carry no Valid-Until, so this is their only defence). `now` None skips the Valid-Until check
+    (snapshot files, which are long expired by design)."""
+    valid_until = release_field(body, "Valid-Until")
+    if now is not None and valid_until is not None and _release_date(valid_until) < now:
+        raise FeedError(f"{suite}: InRelease expired (Valid-Until {_release_date(valid_until)}, now {now})")
+    if previous_date is not None and date < previous_date:
+        raise FeedError(f"{suite}: InRelease Date {date} is older than the {previous_date} a previous build "
+                        "recorded (a replayed old file?)")
+
+
+def load_suite(cache, mirror, suite, used, log, offline=False, family=None, skipped=None, now=None,
+               previous_date=None):
     """({source: version}, Release date) for every component of one suite. The suite's InRelease is verified
-    against ARCHIVE_KEYRINGS[family] before any of its digests is used."""
+    against ARCHIVE_KEYRINGS[family], and for freshness (check_freshness), before any of its digests is used."""
     release_url = f"{mirror}/dists/{suite}/InRelease"
     release_cache = os.path.join(cache, "archive", "release", re.sub(r"[^a-z0-9.-]", "_", mirror) + "_" + suite)
     if offline:
@@ -473,6 +492,7 @@ def load_suite(cache, mirror, suite, used, log, offline=False, family=None, skip
     except FeedError as error:
         raise FeedError(f"{release_url}: {error}") from None
     date, files = parse_release(body)
+    check_freshness(suite, body, date, now, previous_date)
     if not files:
         raise FeedError(f"{release_url} lists no Sources.xz")
     versions = {}
@@ -924,14 +944,17 @@ _SOFT = (Exception,)
 
 
 def build_releases(site_v1, log, cache, work, previous=None, offline=False, releases=RELEASES,
-                   golden_dir=GOLDEN_DIR, gates_dir=GATES_DIR, today=None, retired=RETIRED_RELEASES):
+                   golden_dir=GOLDEN_DIR, gates_dir=GATES_DIR, today=None, retired=RETIRED_RELEASES,
+                   now=None, previous_dates=None):
     """Writes v1/r/<release>-<sha16>.json for every release that passes; returns (releases, sources, failures).
 
     FAIL-SOFT per release: a fetch, ingest or gate failure of one release (or of everything its archive or OSV
     zip feeds) lands in `failures` {release: reason}, and build.py carries that release's last published
     entry forward. Only ConfigError (a broken committed configuration) raises. `previous` is the previous
     build's manifest `releases` (None for the first build). Intermediates (every shipped row with its
-    publish date, every dropped row with its reason) go to `work`/<release>.rows.json."""
+    publish date, every dropped row with its reason) go to `work`/<release>.rows.json. `now` (UTC ISO) enforces
+    InRelease Valid-Until; `previous_dates` {suite: Date} from the previous build's record makes each suite's
+    Date monotonic."""
     started = time.time()
     today = today or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     os.makedirs(os.path.join(site_v1, "r"), exist_ok=True)
@@ -964,7 +987,8 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
         try:
             merged, release_pocket, dates, skipped = {}, None, {}, collections.Counter()
             for mirror, suite in release.suites():
-                versions, date = load_suite(cache, mirror, suite, used, log, offline, release.family, skipped)
+                versions, date = load_suite(cache, mirror, suite, used, log, offline, release.family, skipped,
+                                            now, (previous_dates or {}).get(suite))
                 dates[suite] = date
                 merge_max(merged, versions)
                 if suite == release.codename:
