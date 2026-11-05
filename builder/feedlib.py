@@ -23,7 +23,9 @@ FILE_RE = re.compile(r"^(curated-[0-9a-f]{16}\.json|r/[a-z0-9][a-z0-9.-]{0,40}-[
 
 
 class FeedError(Exception):
-    pass
+    def __init__(self, message="", transient=False):
+        super().__init__(message)
+        self.transient = transient
 
 
 def sha256_hex(data):

@@ -69,7 +69,7 @@ jobs:
           set -euo pipefail
           for pair in "feed:$FEED_KEY_ID" "emergency:$EMERGENCY_KEY_ID"; do
             role=${pair%%:*}; want=${pair#*:}
-            got=$(python3 -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
+            got=$(python3 -I -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
             [ "$got" = "$want" ] || { echo "::error::keys/vulnfeed-$role.pub has key id $got, the workflow pins $want"; exit 1; }
           done
 
@@ -205,7 +205,8 @@ jobs:
           left=$(find "$site" ! -type f ! -type d | head -5)
           [ -z "$left" ] || { echo "::error::unexpected entries after unpacking: $left"; exit 1; }
           export SITE="$site"
-          python3 - <<'PY'
+          [[ "$SERIAL" =~ ^[1-9][0-9]*$ ]] || { echo "::error::bad serial '$SERIAL'"; exit 1; }
+          python3 -I - <<'PY'
           import hashlib, json, os, re, sys
           site, serial, date = os.environ["SITE"], int(os.environ["SERIAL"]), os.environ["DATE"]
           def pairs(items):
@@ -228,6 +229,7 @@ jobs:
               problems.append(f"generated {m.get('generated')!r} is not on {date}")
           # S1 is curated-only. S2 replaces this with a per-release check (file names, sha256, sizes).
           if m.get("releases") != {}: problems.append("releases is not empty (S1 is curated-only)")
+          if m.get("sources") != {}: problems.append("sources is not empty (S1 is curated-only)")
           cur = m.get("curated") or {}
           committed = open("curated/curated.json", "rb").read()
           digest = hashlib.sha256(committed).hexdigest()
@@ -261,7 +263,7 @@ jobs:
           set -euo pipefail
           for pair in "feed:$FEED_KEY_ID" "emergency:$EMERGENCY_KEY_ID"; do
             role=${pair%%:*}; want=${pair#*:}
-            got=$(python3 -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
+            got=$(python3 -I -c 'import base64, sys; b = base64.b64decode(open(sys.argv[1]).read().splitlines()[1]); assert len(b) == 42 and b[:2] == b"Ed"; print(b[2:10][::-1].hex().upper())' "keys/vulnfeed-$role.pub")
             [ "$got" = "$want" ] || { echo "::error::keys/vulnfeed-$role.pub has key id $got, the workflow pins $want"; exit 1; }
           done
 
@@ -369,8 +371,10 @@ jobs:
 
   record:
     name: Commit the build record
-    needs: [build, deploy]
-    if: github.ref == 'refs/heads/main'
+    # Burn the serial as soon as it is signed: a deploy that times out may still go live later, and a re-run
+    # reusing the serial with new bytes would be refused by every device that saw the first one.
+    needs: [build, sign, deploy]
+    if: always() && github.ref == 'refs/heads/main' && needs.sign.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -395,7 +399,7 @@ jobs:
           src="$RUNNER_TEMP/record/build.json"
           [ -f "$src" ] && [ ! -L "$src" ] || { echo "::error::no build record"; exit 1; }
           [ "$(stat -c %s "$src")" -le 262144 ] || { echo "::error::the build record is over 256 KB"; exit 1; }
-          python3 -c 'import json, os, sys; r = json.load(open(sys.argv[1])); s = int(os.environ["SERIAL"]); assert type(r["serial"]) is int and r["serial"] == s and r["manifest"]["serial"] == s, "record serial mismatch"' "$src"
+          python3 -I -c 'import json, os, sys; r = json.load(open(sys.argv[1])); s = int(os.environ["SERIAL"]); assert type(r["serial"]) is int and r["serial"] == s and r["manifest"]["serial"] == s, "record serial mismatch"' "$src"
           case "$SERIAL" in ''|*[!0-9]*) echo "::error::bad serial $SERIAL"; exit 1 ;; esac
           mkdir -p builds
           [ ! -e "builds/$SERIAL.json" ] || { echo "::error::builds/$SERIAL.json already exists"; exit 1; }

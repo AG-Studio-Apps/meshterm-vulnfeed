@@ -16,6 +16,8 @@ import build
 import check
 import sign
 
+check.RETRY_DELAY = 0
+
 GENERATED = "2026-11-05T05:10:00Z"
 FRESH = datetime.datetime(2026, 11, 5, 7, 0, tzinfo=datetime.timezone.utc)
 STALE = datetime.datetime(2026, 11, 6, 6, 0, tzinfo=datetime.timezone.utc)
@@ -126,10 +128,51 @@ class AlertTests(unittest.TestCase):
             handle.write(b" ")
         self.assertEqual(self.kinds(check.evaluate(self.serve(), self.keys, FRESH)), ["curated-sha256"])
 
-    def test_server_down_is_a_problem(self):
+    def test_missing_site_is_a_problem(self):
         url = self.serve()
         shutil.rmtree(self.site)
         self.assertEqual(self.kinds(check.evaluate(url, self.keys, FRESH)), ["fetch-manifest"])
+
+    def test_connection_refused_is_a_problem(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        self.assertEqual(self.kinds(check.evaluate(f"http://127.0.0.1:{port}", self.keys, FRESH)),
+                         ["fetch-manifest"])
+
+    def test_one_blip_is_retried(self):
+        calls = []
+        real = check._fetch_once
+
+        def flaky(url, cap):
+            calls.append(url)
+            if len(calls) == 1:
+                raise check.FeedError("blip", transient=True)
+            return real(url, cap)
+        self.sign_with(self.feed_key)
+        url = self.serve()
+        check._fetch_once = flaky
+        try:
+            self.assertEqual(self.kinds(check.evaluate(url, self.keys, FRESH)), [])
+        finally:
+            check._fetch_once = real
+
+    def test_incomplete_read_is_caught(self):
+        import http.client
+        class R:  # a response whose read() raises IncompleteRead (not an OSError)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n): raise http.client.IncompleteRead(b"x")
+        import urllib.request
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: R()
+        try:
+            with self.assertRaises(check.FeedError) as ctx:
+                check._fetch_once("http://example.invalid/x", 10)
+            self.assertTrue(ctx.exception.transient)
+        finally:
+            urllib.request.urlopen = orig
 
     # --- issue handling ---------------------------------------------------------------------------------
     def problem_result(self):

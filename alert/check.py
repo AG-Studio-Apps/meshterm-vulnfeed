@@ -17,10 +17,12 @@ Environment (all optional):
 """
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import secrets
 import subprocess
+import time
 import sys
 import urllib.error
 import urllib.request
@@ -52,9 +54,10 @@ def _iso(moment):
     return moment.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def fetch(url, cap, token=None):
-    if token and url.startswith(("http://", "https://")):
-        url = f"{url}?r={token}"
+RETRY_DELAY = float(os.environ.get("VULNFEED_ALERT_RETRY_DELAY", "30"))
+
+
+def _fetch_once(url, cap):
     request = urllib.request.Request(url, headers={"Cache-Control": "no-cache",
                                                    "User-Agent": "meshterm-vulnfeed-freshness"})
     try:
@@ -62,10 +65,28 @@ def fetch(url, cap, token=None):
             data = response.read(cap + 1)
     except urllib.error.HTTPError as error:
         error.close()
-        raise FeedError(f"HTTP {error.code} for {url}") from None
+        raise FeedError(f"HTTP {error.code} for {url}", transient=error.code >= 500) from None
+    except http.client.HTTPException as error:
+        # IncompleteRead and friends are not OSError; without this the run crashes and nothing is filed.
+        raise FeedError(f"{type(error).__name__} reading {url}", transient=True) from None
+    except (OSError, urllib.error.URLError) as error:
+        raise FeedError(f"{url}: {error}", transient=True) from None
     if len(data) > cap:
         raise FeedError(f"{url} is larger than {cap} bytes")
     return data
+
+
+def fetch(url, cap, token=None):
+    """One retry after RETRY_DELAY seconds for network errors and 5xx, so a single blip files no issue."""
+    if token and url.startswith(("http://", "https://")):
+        url = f"{url}?r={token}"
+    try:
+        return _fetch_once(url, cap)
+    except FeedError as error:
+        if not getattr(error, "transient", False):
+            raise
+    time.sleep(RETRY_DELAY)
+    return _fetch_once(url, cap)
 
 
 def evaluate(base_url, keys_dir, now, max_age_hours=24):

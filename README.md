@@ -27,7 +27,7 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
 - `keys/`: the two public keys the app pins. See `keys/README.md` for the ids and the Swift snippet.
 - `builds/<serial>.json`: one per published build (the manifest, the files carried, the build log),
   committed by CI.
-- `alert/`: the external freshness alert (a systemd user timer on James's box).
+- `alert/`: the external freshness alert (a systemd user timer on the maintainer's machine).
 
 ## The manifest
 
@@ -123,7 +123,7 @@ copy of `keys/`, checks the curated file's sha256, and files ONE issue in the pr
 (label `vulnfeed`) when `generated` is more than 24 hours old, the pair does not verify, or a file is missing.
 It comments again only when the problem changes or once a day, flags an emergency-key signature, and closes
 the issue when the feed recovers. Dry run unless `VULNFEED_ALERT_DRY_RUN=0`. The timer runs at 06:40 and 18:40
-UTC; the unit's PATH includes `/home/linuxbrew/.linuxbrew/bin` for `gh`.
+UTC.
 
 ## Keys and incidents
 

@@ -32,13 +32,9 @@ with no `bodyVersion:` argument). An emergency signature may omit ` commit=`.
 
 ## Where the secret keys are
 
-- Feed key: `~/.config/meshterm-vulnfeed/feed.key` on James's build box, mode 600, **no password** (minisign
-  `-W`), because CI signs unattended. It becomes the `VULNFEED_MINISIGN_KEY` secret of the `vulnfeed-signing`
-  environment. Keep an offline recovery copy, then delete the box copy once the secret is set.
-- Emergency key: `~/.config/meshterm-vulnfeed/emergency.key`, mode 600, **password-protected**. Its passphrase
-  was generated at random and is in `~/.config/meshterm-vulnfeed/emergency.password` (mode 600). Move both to
-  offline storage (the passphrase into the password manager) and delete them from the box: an agent on the build
-  box can read `~/.config`.
+- Feed key: **no password** (minisign `-W`), because CI signs unattended. It lives only as the
+  `VULNFEED_MINISIGN_KEY` secret of the `vulnfeed-signing` environment, plus an offline recovery copy.
+- Emergency key: **password-protected**, kept offline with its passphrase in the password manager.
 
 Neither secret key is ever committed; `.gitignore` refuses `*.key`.
 
