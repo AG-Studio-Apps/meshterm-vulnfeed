@@ -1,4 +1,5 @@
-"""S2: the OSV release files for dpkg releases (Ubuntu and Debian). Python 3 stdlib only.
+"""S2 + S4: the OSV release files for dpkg releases (Ubuntu and Debian) and apk releases (Alpine). Python 3
+stdlib only.
 
 meshTerm docs/plan-host-cve-scanner.md sections 3.1-3.3 (the rules), 4.1 (the file) and 4.2 (the gates).
 
@@ -29,6 +30,37 @@ Then, per release, with the archive Sources of every pocket and component loaded
    Medium.
    Only ids that are High or Critical stay; a row with none left is dropped.
 8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`.
+
+Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
+1. A range with a not-affected marker (fixed "0" / "0-r0") is dropped whole and counted. Each `introduced` is
+   normalised (1a): an imagemagick upstream X.Y.Z-N (7.0.0-0) becomes the dotted X.Y.Z.N aports writes, another
+   origin's X.Y.Z-0 (go 1.21.0-0) plain X.Y.Z, any other unparseable value (a date) "0"; all are counted, and the
+   "0" kind is gated (INTRODUCED_REJECT_LIMIT). A fixed value apk cannot order is taken out of the walk and kept as
+   a pair of its own for resolve() to reject; an introduced that then follows an open one restarts the range there
+   (the earlier range ends at its bad fix), never widening it. The remaining events are sorted by apk version ("0" lowest) and walked as OSV
+   does: introduced opens, fixed closes; each (introduced, the FIRST fixed after it) is one row (OSV parity:
+   postgresql17 CVE-2026-2006 [0, 17.8-r0, 17.9-r0] is affected below 17.8-r0 only). A fixed with no open
+   introduced (the 2nd/3rd fixed of [0, f1, f2, f3], or a fixed below its introduced) is dropped and counted,
+   not a failure.
+4. A fixed value that is date-shaped or not a valid apk version (builder/apkver.py) is rejected (the same
+   REJECT_LIMIT gate).
+5, 6. No baseline cut, no leading-token check and no published check: Alpine fixes come from secdb, built
+   from the branch's aports secfixes (so a fix is in that branch's repository), and there is no
+   release-day archive to cut against. APKINDEX is RSA-signed, which the stdlib cannot verify.
+7. Severity: the highest CVSS 3.x/4.0 score, else Medium.
+8. Kernel origins (APK_KERNELS) fold with a null publishedDate: OSV Alpine has no fix date (a record's
+   `published` is the CVE's NVD date, older than the fix), and the app never counts a pending kernel restart
+   from a null date.
+
+EL (S5, format "rpm", keyed by BINARY rpm name: OSV's AlmaLinux and Red Hat records name binaries and no source
+rpm; README "AlmaLinux and RHEL") takes the Alpine pass with these differences: releases may MERGE several OSV
+ecosystems (RHEL's baseos, appstream, crb); only records naming an upstream CVE ship; debuginfo / debugsource and
+every kernel binary but kernel-core (and its rt / 64k / debug variants), and the kernel source's userspace binaries
+(perf, bpftool ...), are dropped; EVRs compare with builder/rpmver.py (modular builds without their module build ids
+when matched); severity is the advisory's own rating (Alma's summary prefix, RHEL's classification reference; an
+unrated RHEL advisory's own CVSS); a modular fix carries the module streams named in its advisories' summaries;
+kernel rows keep the advisory date. The file is compact (release_body), and a
+file over FILE_CAP keeps fewer superseded fixes per binary (prune_superseded).
 """
 import collections
 import datetime
@@ -43,8 +75,10 @@ import tempfile
 import time
 import zipfile
 
+import apkver
 import cvss
 import netfetch
+import rpmver
 from dpkgver import DpkgVersion, VersionError, sort_key
 from feedlib import FILE_CAP, FeedError, content_name, sha256_hex
 
@@ -65,19 +99,50 @@ DEBIAN_SECURITY = "https://security.debian.org/debian-security"
 SNAPSHOT = "https://snapshot.debian.org/archive/debian"
 
 REJECT_LIMIT = 0.005        # rejected fixed versions, per OSV ecosystem, as a share of fixed rows
+# Alpine `introduced` values that are neither an apk version nor an upstream X.Y.Z-N (dates: libdwarf
+# 1999-12-14, jq 2026-04-02) are read as "0" (normalise_apk_introduced), which WIDENS their range; that kind is
+# gated on its own, as a share of the zip's fixed range events. The X.Y.Z-N kind (ImageMagick 7.0.0-0, 104 of
+# 17,856 rows on 2026-11-05) is normalised to the dotted form aports uses and is only counted.
+INTRODUCED_REJECT_LIMIT = 0.02
 ROW_SWING = 0.30            # per-release row count change allowed against the previous build
+CAP_HEADROOM_WARN = 0.05    # a release file within 5% of FILE_CAP warns in the build record (review L1)
 ROW_SWING_FLOOR = 25        # ... or this many rows, whichever is larger (small files swing by single rows)
 HIGH = cvss.HIGH
 
 
+_OSV_ZIPS = {"ubuntu": "Ubuntu", "debian": "Debian", "alpine": "Alpine", "alma": "AlmaLinux", "rhel": "Red Hat"}
+_FORMATS = {"alpine": "apk", "alma": "rpm", "rhel": "rpm"}
+
+
 class Release:
-    def __init__(self, key, family, ecosystem, codename, esm=False, snapshot=None):
+    """One release file. `ecosystem` is the OSV `affected[].package.ecosystem` it takes; `ecosystems` (a regular
+    expression) replaces it for a release that MERGES several (RHEL: a major's baseos, appstream and crb, S5)."""
+
+    def __init__(self, key, family, ecosystem, codename, esm=False, snapshot=None, ecosystems=None):
         self.key, self.family, self.ecosystem, self.codename = key, family, ecosystem, codename
         self.esm, self.snapshot = esm, snapshot
+        self.ecosystems = re.compile(ecosystems) if ecosystems else None
 
     @property
     def osv_zip(self):
-        return "Ubuntu" if self.family == "ubuntu" else "Debian"
+        return _OSV_ZIPS[self.family]
+
+    @property
+    def format(self):
+        """The manifest `format`: "apk" for Alpine, "rpm" for AlmaLinux and RHEL (S5), "dpkg" for Ubuntu and
+        Debian."""
+        return _FORMATS.get(self.family, "dpkg")
+
+    @property
+    def has_archive(self):
+        """Whether the release has a Sources archive (and a baseline) to load. Only dpkg releases do (Alpine S4,
+        EL S5 have neither)."""
+        return self.format == "dpkg"
+
+    def takes(self, ecosystem):
+        if self.ecosystems is not None:
+            return isinstance(ecosystem, str) and bool(self.ecosystems.match(ecosystem))
+        return ecosystem == self.ecosystem
 
     @property
     def base_key(self):
@@ -109,10 +174,31 @@ RELEASES = [
     Release("debian-11", "debian", "Debian:11", "bullseye", snapshot="20210815T000000Z"),
     Release("debian-12", "debian", "Debian:12", "bookworm", snapshot="20230611T000000Z"),
     Release("debian-13", "debian", "Debian:13", "trixie", snapshot="20250810T000000Z"),
+    # Alpine 3.20+ (plan 3.4). 3.20 (EOL 2026-04-01) and 3.21 (EOL 2026-11-01) are past end of life per
+    # alpinelinux.org/releases.json; kept for now (their hosts still exist), dropping them is open.
+    Release("alpine-3.20", "alpine", "Alpine:v3.20", None),
+    Release("alpine-3.21", "alpine", "Alpine:v3.21", None),
+    Release("alpine-3.22", "alpine", "Alpine:v3.22", None),
+    Release("alpine-3.23", "alpine", "Alpine:v3.23", None),
+    Release("alpine-3.24", "alpine", "Alpine:v3.24", None),
+    # S5 (plan 3.4, D7). AlmaLinux from its own OSV data (binary rpm names, the summary-prefix severity). RHEL from
+    # Red Hat's OSV data (binary rpm names, each advisory's Red Hat rating), one file per major merging the repositories every subscription
+    # has (baseos, appstream, crb; RHEL 10 publishes per minor release instead, 10.0, 10.1 ...: all merged); EUS /
+    # AUS / E4S / TUS streams and the add-on repositories are left out. Rocky Linux hosts use the RHEL file (Rocky's
+    # own OSV data is incomplete: `Rocky Linux:9` has no openssl-libs at all).
+    Release("alma-8", "alma", "AlmaLinux:8", None),
+    Release("alma-9", "alma", "AlmaLinux:9", None),
+    Release("alma-10", "alma", "AlmaLinux:10", None),
+    Release("rhel-8", "rhel", None, None, ecosystems=r"^Red Hat:enterprise_linux:8::(baseos|appstream|crb)\Z"),
+    Release("rhel-9", "rhel", None, None, ecosystems=r"^Red Hat:enterprise_linux:9::(baseos|appstream|crb)\Z"),
+    Release("rhel-10", "rhel", None, None,
+            ecosystems=r"^Red Hat:enterprise_linux:10(\.\d+|::(baseos|appstream|crb))\Z"),
 ]
 RELEASE_KEYS = tuple(r.key for r in RELEASES)
 
 _SOURCE_NAME = re.compile(r"^[a-z0-9][a-z0-9.+-]+$")
+# Alpine origin names also use `_` (wpa_supplicant, mini_httpd, sdl2_image).
+_ORIGIN_NAME = re.compile(r"^[a-z0-9][a-z0-9._+-]*$")
 _DATE_SHAPED = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _CVE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 _ADVISORY = re.compile(r"^(USN|DSA|DLA|DTSA)-")
@@ -127,8 +213,42 @@ _AVAIL_EXCLUDED = ("Livepatch subscription required", "Available with Ubuntu Pro
 _NON_KERNEL = re.compile(r"^linux-(firmware.*|base|atm|sgx.*|tools-common|doc)$")
 
 
-def is_kernel(source):
+# Alpine kernel origins. NOT linux-pam (userspace PAM), linux-headers, linux-firmware*, linux-tools.
+APK_KERNELS = frozenset({"linux-lts", "linux-edge", "linux-rpi", "linux-virt", "linux-stable"})
+# EL (S5): the kernel binaries the app matches the RUNNING kernel by (`kernel-core-$(uname -r)`, plan 3.4; the
+# variant by uname's `+rt` / `+64k` / `+debug` suffix). Every other binary of the kernel source (`kernel`,
+# `kernel-modules*`, `kernel-tools*`, `kernel-headers`, `kernel-devel*` ...) is dropped and counted: the kernel is
+# matched only through the running one, never as an ordinary package (rpm keeps 3 kernels installed).
+RPM_KERNELS = frozenset({"kernel-core", "kernel-rt-core", "kernel-64k-core", "kernel-debug-core",
+                         "kernel-rt-debug-core", "kernel-64k-debug-core"})
+# EL binary rpm names: letters of either case (NetworkManager, perl-DBI), digits, . _ + -.
+_RPM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
+
+
+def is_kernel(source, fmt="dpkg"):
+    if fmt == "apk":
+        return source in APK_KERNELS
+    if fmt == "rpm":
+        return source in RPM_KERNELS
     return (source == "linux" or source.startswith("linux-")) and not _NON_KERNEL.match(source)
+
+
+# EL userspace binaries built from the KERNEL source rpm (review L2): perf, bpftool, rtla ... Their fixes are the
+# kernel advisory's (RHSA "kernel security update" names them beside kernel-core), so like the kernel's other
+# binaries they never ship as ordinary rows: a host would otherwise list the kernel's CVEs under "perf".
+RPM_KERNEL_USERSPACE = frozenset({"perf", "python3-perf", "python-perf", "bpftool", "rtla", "rv", "libperf",
+                                  "libperf-devel"})
+
+
+def is_rpm_kernel_family(name):
+    """A binary of the EL kernel source (`kernel`, `kernel-*`, and the userspace tools it builds): only RPM_KERNELS
+    ship, as kernel rows."""
+    return name == "kernel" or name.startswith("kernel-") or name in RPM_KERNEL_USERSPACE
+
+
+def name_ok(source, fmt="dpkg"):
+    pattern = {"apk": _ORIGIN_NAME, "rpm": _RPM_NAME}.get(fmt, _SOURCE_NAME)
+    return isinstance(source, str) and bool(pattern.match(source))
 
 
 class ShapeError(Exception):
@@ -165,6 +285,127 @@ def range_pairs(affected):
                 introduced = None
             else:
                 raise ShapeError(f"event kind {kind}")
+    return pairs
+
+
+def _event_list(rng):
+    """[(kind, value)] of one range, after the checks every family shares."""
+    if not isinstance(rng, dict) or rng.get("type") != "ECOSYSTEM":
+        raise ShapeError(f"range type {rng.get('type') if isinstance(rng, dict) else rng!r}")
+    events = rng.get("events")
+    if not isinstance(events, list) or not events:
+        raise ShapeError("no events")
+    out = []
+    for event in events:
+        if not isinstance(event, dict) or len(event) != 1:
+            raise ShapeError(f"event {event!r}")
+        (kind, value), = event.items()
+        if not isinstance(value, str) or not value:
+            raise ShapeError(f"event value {value!r}")
+        if kind not in ("introduced", "fixed"):
+            raise ShapeError(f"event kind {kind}")
+        out.append((kind, value))
+    return out
+
+
+def _apk_event_key(event):
+    kind, value = event
+    return (0, 0) if kind == "introduced" and value == "0" else (1, apkver.sort_key(value))
+
+
+# Not-affected markers: a range whose fixed is "0" / "0-r0" says the package never had the bug (secdb lists a
+# CVE with fix "0" for a branch that was never affected). Such a range is dropped whole and counted.
+NOT_AFFECTED_FIXED = ("0", "0-r0")
+# OSV Alpine `introduced` values apk cannot parse (rule 1a of the Alpine notes). An upstream `X.Y.Z-N` is normalised
+# only where the meaning is known (review L4): ImageMagick's `7.0.0-0` / `6.9.10-54` are the versions aports writes
+# dotted (imagemagick 7.1.2.15-r0), so the imagemagick origins get `X.Y.Z.N`; any other origin's `X.Y.Z-0` (go
+# 1.21.0-0, a semver "lowest 1.21.0" marker) becomes plain `X.Y.Z`, since the dotted `1.21.0.0` sorts ABOVE go's own
+# 1.21.0-r0 and would miss it. Anything else (libdwarf 1999-12-14, jq 2026-04-02: dates, not versions; another
+# origin's X.Y.Z-N with N > 0) becomes "0".
+_UPSTREAM_DASHED = re.compile(r"^\d+(\.\d+)*-\d+$")
+_DOTTED_UPSTREAM = re.compile(r"^imagemagick\d*(-.*)?$")
+INTRO_NORMALISED = "introduced normalised (X.Y.Z-N -> X.Y.Z.N)"
+INTRO_DASH_ZERO = "introduced X.Y.Z-0 read as X.Y.Z"
+INTRO_ZEROED = "introduced unparseable -> 0"
+NOT_AFFECTED = "not-affected range (fixed 0) dropped"
+BAD_FIXED = "bad fixed event kept apart (range walked without it)"
+INTRO_REOPENED = "introduced while open (its fixed was bad): range restarted at the later introduced"
+
+
+def _apk_ok(value):
+    return apkver.validate(value) and not _DATE_SHAPED.match(value)
+
+
+def normalise_apk_introduced(value, counters=None, origin=None):
+    """An Alpine `introduced` as apk can compare it (rule 1a): "0" and valid apk versions unchanged; an upstream
+    `X.Y.Z-N` dotted for the imagemagick origins; another origin's `X.Y.Z-0` as `X.Y.Z`; anything else "0".
+    `counters` counts the three kinds of change."""
+    if value == "0" or _apk_ok(value):
+        return value
+    if not _DATE_SHAPED.match(value) and _UPSTREAM_DASHED.match(value):
+        if isinstance(origin, str) and _DOTTED_UPSTREAM.match(origin):
+            changed, counter = value.replace("-", "."), INTRO_NORMALISED
+        elif value.endswith("-0"):
+            changed, counter = value[:-2], INTRO_DASH_ZERO
+        else:
+            changed = counter = None
+        if changed is not None and _apk_ok(changed):
+            if counters is not None:
+                counters[counter] += 1
+            return changed
+    if counters is not None:
+        counters[INTRO_ZEROED] += 1
+    return "0"
+
+
+def apk_range_pairs(affected, counters):
+    """[(introduced, fixed)] for one Alpine affected[] entry (rule 1 of the Alpine notes above). Dropped fixed
+    events are counted in `counters`: `redundant fixed` (a later fixed of an already closed range) and `empty
+    range (fixed below introduced)` (a fixed before any introduced, such as prosody [13.0.0, 0.12.6-r0)).
+    Raises ShapeError on any other shape."""
+    ranges = affected.get("ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise ShapeError("no ranges")
+    pairs = []
+    for rng in ranges:
+        events = _event_list(rng)
+        counters["shape [" + ", ".join("introduced 0" if (k, v) == ("introduced", "0") else
+                                       "introduced X" if k == "introduced" else k for k, v in events) + "]"] += 1
+        if any(k == "fixed" and v in NOT_AFFECTED_FIXED for k, v in events):
+            counters[NOT_AFFECTED] += 1
+            continue
+        origin = (affected.get("package") or {}).get("name")
+        events = [(k, normalise_apk_introduced(v, counters, origin) if k == "introduced" else v) for k, v in events]
+        # A fixed value apk cannot order (opensmtpd 6.6.2p1-r0) is kept out of the walk, so one bad event never
+        # unsorts the range or costs it a good fix; it becomes a pair of its own (with the introduced it followed
+        # in the given order) for resolve_apk() to reject and count toward REJECT_LIMIT.
+        bad, last_intro = [], "0"
+        for kind, value in events:
+            if kind == "introduced":
+                last_intro = value
+            elif not _apk_ok(value):
+                bad.append((last_intro, value))
+        if bad:
+            counters[BAD_FIXED] += len(bad)
+            events = [(k, v) for k, v in events if k == "introduced" or _apk_ok(v)]
+        events = sorted(events, key=_apk_event_key)
+        introduced, closed_any = None, False
+        for kind, value in events:
+            if kind == "introduced":
+                if introduced is not None:
+                    if not bad:
+                        raise ShapeError("introduced twice without a fixed between")
+                    # The fixed between them was a bad value kept apart (review L5): the earlier range ends at that
+                    # bad fix, already a pair of its own (rejected and counted), and a new range starts here. Keeping
+                    # the lower introduced open instead would widen the later range over the gap between them.
+                    counters[INTRO_REOPENED] += 1
+                introduced = value
+            elif introduced is None:
+                counters["redundant fixed" if closed_any else "empty range (fixed below introduced)"] += 1
+            else:
+                pairs.append((introduced, value))
+                introduced, closed_any = None, True
+        pairs.extend(bad)
     return pairs
 
 
@@ -225,8 +466,60 @@ def severity_of_record(record, counters):
     return ubuntu, best
 
 
+# AlmaLinux severity (plan 3.2): its records carry no score, only the summary's prefix ("Important: php:8.1 security
+# update"), the Red Hat severity of the advisory.
+_ALMA_PREFIX = {"critical": 4, "important": 3, "moderate": 2, "low": 1}
+# A module stream named in an EL advisory's summary (`php:8.1`, `virt:rhel`, `389-ds:1.4`, `idm:DL1`): a word of its
+# own, `name:stream` with no further colon (the summary's own "Important:" has no stream after it).
+_STREAM = re.compile(r"(?:^|(?<=[\s(]))([A-Za-z0-9][A-Za-z0-9_.+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*)(?=[\s,)]|\Z)")
+
+
+STREAM_MAX = 64     # a stream token's length limit, meshTerm's ReleaseIndex.isStream (app review L7)
+LABEL_MAX = 128     # a MODULARITYLABEL's, meshTerm's PackageInventory.parseRpm
+
+
+def module_streams(summary):
+    """The `name:stream` tokens of an EL advisory summary, sorted, no duplicates, none over STREAM_MAX."""
+    if not isinstance(summary, str):
+        return []
+    return sorted({t for t in (m.group(1).rstrip(".") for m in _STREAM.finditer(summary)) if len(t) <= STREAM_MAX})
+
+
+# RHEL severity (review H1): each Red Hat advisory's own rating, the `#important` anchor of its classification link
+# (https://access.redhat.com/security/updates/classification/#important; www.redhat.com on old advisories). It rates
+# every id the advisory fixes FOR THAT PRODUCT. The zip-wide CVSS of an id is the worst score any Red Hat product's
+# advisory gave it (OpenShift, RHEL 7 ...), not the RHEL rating: on the 2026-11-05 zip it made 416 of 847 RHEL-9
+# Moderate advisories ship as High or Critical, and 18 Important ones as Medium.
+# Id lists (S6 doc, review LOW): the rating covers every CVE the advisory names, and Red Hat's OSV data attaches every
+# CVE of an advisory to every binary it ships (RHSA-2026:42828, httpd:2.4, lists the httpd CVEs under mod_http2), so a
+# binary's ids can be inflated; the row decision and the per-source-rpm finding count are still right (README).
+_RH_RATING = re.compile(r"(?:access|www)\.redhat\.com/security/updates/classification/?#(critical|important|moderate|low)"
+                        r"(?![a-z])", re.IGNORECASE)
+
+
+def redhat_rating_band(record):
+    """The band of a Red Hat record's own severity rating (its classification reference), or None when it has none
+    (a bare classification link, 46 RHEL-9 advisories on 2026-11-05). Two different ratings (2 advisories): the
+    higher."""
+    best = None
+    for ref in record.get("references") or []:
+        url = ref.get("url") if isinstance(ref, dict) else None
+        match = _RH_RATING.search(url) if isinstance(url, str) else None
+        if match:
+            best = _max_none(best, _ALMA_PREFIX[match.group(1).lower()])
+    return best
+
+
+def alma_prefix_band(summary):
+    """The band of an AlmaLinux summary's severity prefix, or None."""
+    if not isinstance(summary, str) or ":" not in summary:
+        return None
+    return _ALMA_PREFIX.get(summary.split(":", 1)[0].strip().lower())
+
+
 class Candidate:
-    __slots__ = ("ids", "advisory", "advisory_ids", "pkg_priority", "adv_date", "rec_date", "modified", "tokens")
+    __slots__ = ("ids", "advisory", "advisory_ids", "pkg_priority", "adv_date", "rec_date", "modified", "tokens",
+                 "prefix", "streams", "own_cvss")
 
     def __init__(self):
         self.ids = set()
@@ -237,6 +530,10 @@ class Candidate:
         self.rec_date = None     # earliest `published` of any record naming it (fallback)
         self.modified = None     # newest `modified` of the records naming it
         self.tokens = set()
+        self.prefix = {}            # EL: id -> the highest advisory rating of the records naming it (Alma: the
+        #                             summary prefix; RHEL: the classification reference)
+        self.own_cvss = {}          # RHEL: id -> the highest CVSS of the naming records that carry NO rating
+        self.streams = set()        # EL: the module streams (`php:8.1`) of the records naming a modular fix
 
 
 def _date(text):
@@ -246,7 +543,13 @@ def _date(text):
 def ingest(zip_path, releases, log):
     """Reads one OSV zip. Returns (candidates {release key: {(src, intro, fixed): Candidate}}, cve severity
     info {id: (ubuntu, cvss)}, stats Counter, unknown-shape examples, newest `modified`)."""
-    by_eco = {r.ecosystem: r for r in releases}
+    by_eco = {r.ecosystem: r for r in releases if r.ecosystems is None}
+    merged = [r for r in releases if r.ecosystems is not None]
+
+    def release_for(ecosystem):
+        found = by_eco.get(ecosystem)
+        return found if found is not None else next((r for r in merged if r.takes(ecosystem)), None)
+
     candidates = {r.key: {} for r in releases}
     info = {}
     stats = collections.Counter()
@@ -269,6 +572,8 @@ def ingest(zip_path, releases, log):
             rid = record.get("id", "")
             upstream = [u for u in (record.get("upstream") or []) + (record.get("aliases") or [])
                         if isinstance(u, str) and _CVE.match(u)]
+            if not upstream and rid.startswith("ALPINE-") and _CVE.match(rid[len("ALPINE-"):]):
+                upstream = [rid[len("ALPINE-"):]]   # Alpine ids are upstream CVEs: never ship ALPINE-CVE-*
             ids = sorted(set(upstream)) or [rid]
             is_adv = bool(_ADVISORY.match(rid))
             sev = severity_of_record(record, stats)
@@ -280,16 +585,41 @@ def ingest(zip_path, releases, log):
             elif rid not in info:
                 info[rid] = sev
             published, modified_date = _date(record.get("published")), _date(modified)
+            summary = record.get("summary")
+            alma_band = alma_prefix_band(summary)
+            # RHEL rates by the advisory's own Red Hat rating, its own CVSS only when it has none (review H1).
+            rh_band = redhat_rating_band(record)
+            streams = module_streams(summary)
             for affected in record.get("affected") or []:
                 package = affected.get("package") or {}
-                release = by_eco.get(package.get("ecosystem"))
+                release = release_for(package.get("ecosystem"))
                 if release is None:
                     continue
                 stats[f"{release.key}: affected entries"] += 1
                 source = package.get("name")
+                if release.format == "rpm":
+                    # S5: only records naming an upstream CVE ship (the app's ids are CVEs; ALBA / ALEA / RHBA
+                    # without one fix no CVE); debug symbols and the kernel's other binaries never match a host.
+                    if not upstream:
+                        stats[f"{release.key}: no CVE id (dropped)"] += 1
+                        continue
+                    if isinstance(source, str) and source.endswith(("-debuginfo", "-debugsource")):
+                        stats[f"{release.key}: debuginfo / debugsource (dropped)"] += 1
+                        continue
+                    if isinstance(source, str) and is_rpm_kernel_family(source) and source not in RPM_KERNELS:
+                        stats[f"{release.key}: " + ("kernel userspace binary (perf, bpftool ...) (dropped)"
+                                                    if source in RPM_KERNEL_USERSPACE else
+                                                    "kernel binary other than kernel-core (dropped)")] += 1
+                        continue
                 try:
-                    pairs = range_pairs(affected)
-                    if not isinstance(source, str) or not _SOURCE_NAME.match(source):
+                    dropped = collections.Counter()
+                    if release.format == "apk":
+                        pairs = apk_range_pairs(affected, dropped)
+                        for reason, count in dropped.items():
+                            stats[f"{release.key}: {reason}"] += count
+                    else:
+                        pairs = range_pairs(affected)
+                    if not name_ok(source, release.format):
                         raise ShapeError(f"source name {source!r}")
                 except ShapeError as error:
                     stats[f"{release.key}: unknown range shape"] += 1
@@ -297,7 +627,8 @@ def ingest(zip_path, releases, log):
                         shapes.append(f"{rid} {release.ecosystem} {source}: {error}")
                     continue
                 if not pairs:
-                    stats[f"{release.key}: unfixed (dropped)"] += 1
+                    if not (release.format == "apk" and dropped[NOT_AFFECTED]):
+                        stats[f"{release.key}: unfixed (dropped)"] += 1
                     continue
                 if release.family == "ubuntu":
                     availability = (affected.get("ecosystem_specific") or {}).get("availability")
@@ -324,6 +655,19 @@ def ingest(zip_path, releases, log):
                     if pkg_priority is not None and release.family == "ubuntu":
                         for cve in ids:
                             cand.pkg_priority[cve] = max(pkg_priority, cand.pkg_priority.get(cve, -1))
+                    if release.format == "rpm":
+                        band = rh_band if release.family == "rhel" else alma_band
+                        rated_cvss = sev[1] if release.family == "rhel" and band is None else None
+                        if band is not None:
+                            for cve in ids:
+                                cand.prefix[cve] = max(band, cand.prefix.get(cve, -1))
+                        elif rated_cvss is not None:
+                            for cve in ids:
+                                cand.own_cvss[cve] = _max_none(cand.own_cvss.get(cve), rated_cvss)
+                        if rpmver.is_modular(fixed):
+                            cand.streams.update(streams)
+                            if not streams:
+                                stats[f"{release.key}: modular fix with no stream in its summary"] += 1
                     if is_adv:
                         cand.advisory = True
                         cand.advisory_ids.update(ids)
@@ -628,6 +972,100 @@ def resolve(release, cands, info, archive, baseline, counters, decisions):
     return rows, examples, dropped
 
 
+def resolve_apk(release, cands, info, counters, decisions):
+    """Rules for one Alpine release (the Alpine notes at the top): reject bad versions, severity, kernel fold.
+    Same return shape as resolve()."""
+    rows, examples, dropped = [], [], []
+    for (source, introduced, fixed), cand in sorted(cands.items()):
+        reason = None
+        if _DATE_SHAPED.match(fixed) or (introduced != "0" and _DATE_SHAPED.match(introduced)):
+            reason = "date-shaped"
+        elif not apkver.validate(fixed):
+            reason = "fixed not an apk version"
+        elif introduced != "0" and not apkver.validate(introduced):
+            reason = "introduced not an apk version"
+        if reason:
+            counters["rejected"] += 1
+            counters[f"rejected: {reason}"] += 1
+            dropped.append([source, introduced, fixed, f"rejected: {reason}"])
+            if len(examples) < 8:
+                examples.append(f"{source} [{introduced!r}, {fixed!r}] ({reason}; "
+                                f"{', '.join(sorted(cand.ids))[:60]})")
+            continue
+        kept, rules, best = {}, {}, -1
+        for cve in cand.ids:
+            band, rule = severity(release, cve, cand, info)
+            decisions[rule] += 1
+            best = max(best, band)
+            if band >= HIGH:
+                kept[cve] = band
+                rules[cve] = rule
+        if not kept:
+            counters["below High (dropped)"] += 1
+            dropped.append([source, introduced, fixed, "below High (dropped)", best])
+            continue
+        counters["shipped"] += 1
+        kernel = is_kernel(source, "apk")
+        if kernel:
+            counters["kernel rows"] += 1
+        # `date` is the CVE's record date, kept in the intermediates only; the file carries no package date and
+        # a null kernel date (no fix date in OSV Alpine).
+        rows.append({"source": source, "introduced": introduced, "fixed": fixed,
+                     "severity": max(kept.values()), "ids": sorted(kept), "kernel": kernel,
+                     "date": cand.rec_date, "dateSource": "record (CVE, not the fix)", "modified": cand.modified,
+                     "rules": dict(sorted(rules.items()))})
+    return rows, examples, dropped
+
+
+def resolve_rpm(release, cands, info, counters, decisions):
+    """Rules for one EL release (S5): reject bad versions, severity (Alma: the summary prefix; RHEL: the advisory's
+    Red Hat rating, else its own CVSS; else Medium), the kernel fold (kernel-core and its variants, with the advisory's date), module streams merged per
+    (binary, introduced, fixed) across every advisory naming it. Same return shape as resolve()."""
+    rows, examples, dropped = [], [], []
+    for (source, introduced, fixed), cand in sorted(cands.items()):
+        reason = None
+        if _DATE_SHAPED.match(fixed) or (introduced != "0" and _DATE_SHAPED.match(introduced)):
+            reason = "date-shaped"
+        elif not rpmver.validate(fixed):
+            reason = "fixed not an rpm EVR"
+        elif introduced != "0" and not rpmver.validate(introduced):
+            reason = "introduced not an rpm EVR"
+        if reason:
+            counters["rejected"] += 1
+            counters[f"rejected: {reason}"] += 1
+            dropped.append([source, introduced, fixed, f"rejected: {reason}"])
+            if len(examples) < 8:
+                examples.append(f"{source} [{introduced!r}, {fixed!r}] ({reason}; "
+                                f"{', '.join(sorted(cand.ids))[:60]})")
+            continue
+        kept, rules, best = {}, {}, -1
+        for cve in cand.ids:
+            band, rule = severity(release, cve, cand, info)
+            decisions[rule] += 1
+            best = max(best, band)
+            if band >= HIGH:
+                kept[cve] = band
+                rules[cve] = rule
+        if not kept:
+            counters["below High (dropped)"] += 1
+            dropped.append([source, introduced, fixed, "below High (dropped)", best])
+            continue
+        counters["shipped"] += 1
+        kernel = is_kernel(source, "rpm")
+        if kernel:
+            counters["kernel rows"] += 1
+        modular = rpmver.is_modular(fixed)
+        if modular:
+            counters["modular rows"] += 1
+            if not cand.streams:
+                counters["modular rows with no stream (matched by major.minor)"] += 1
+        rows.append({"source": source, "introduced": introduced, "fixed": fixed,
+                     "severity": max(kept.values()), "ids": sorted(kept), "kernel": kernel,
+                     "date": cand.rec_date, "dateSource": "advisory", "modified": cand.modified,
+                     "rules": dict(sorted(rules.items())), "streams": sorted(cand.streams) if modular else []})
+    return rows, examples, dropped
+
+
 def severity(release, cve, cand, info):
     """(band, rule) for one id of one row, by the release family's chain (plan 3.2)."""
     ubuntu, score = info.get(cve, (None, None))
@@ -639,29 +1077,108 @@ def severity(release, cve, cand, info):
         if score is not None:
             return cvss.band(score), "cvss"
         return cvss.MEDIUM, "default medium"
+    if release.family == "alma":
+        # Alma publishes no score: the advisory's own severity word, the same for every id it fixes.
+        if cve in cand.prefix:
+            return cand.prefix[cve], "alma summary prefix"
+        return cvss.MEDIUM, "default medium"
+    if release.family == "rhel":
+        # Never the zip-wide `info` (every Red Hat product's worst score): the advisory's own rating, else the
+        # CVSS of the advisory that names the fix, else Medium (review H1).
+        if cve in cand.prefix:
+            return cand.prefix[cve], "red hat rating"
+        if cve in cand.own_cvss:
+            return cvss.band(cand.own_cvss[cve]), "advisory cvss (no rating)"
+        return cvss.MEDIUM, "default medium"
     if score is not None:
         return cvss.band(score), "cvss"
+    if release.family == "alpine":
+        return cvss.MEDIUM, "default medium"
     if cve in cand.advisory_ids:
         return HIGH, "dsa/dla exists -> high"
     return cvss.MEDIUM, "default medium"
 
 
 def release_body(release, rows):
-    """The shipped JSON object (plan 4.1)."""
+    """The shipped JSON object (plan 4.1). An rpm file (S5) is COMPACT: keyed by binary rpm name, the fixes are
+    shared (one advisory fixes every binary of its source package at one EVR), so the file holds a sorted CVE id
+    table `ids`, a fix table `fixes` of `[introduced, fixed, severity, [id index ...], [stream ...]]` sorted by fixed
+    EVR, and per binary the sorted indexes of its fixes (`pkgs`). A binary's rows are its fixes; the row count is the
+    number of (binary, fix) pairs plus the kernel rows, as for the other formats."""
+    apk = release.format == "apk"
+    rpm = release.format == "rpm"
     pkgs, kernel = collections.defaultdict(list), collections.defaultdict(list)
     for row in rows:
         if row["kernel"]:
             kernel[row["source"]].append([row["introduced"], row["fixed"], row["severity"], len(row["ids"]),
-                                          row["date"]])
+                                          None if apk else row["date"]])
+        elif rpm:
+            pkgs[row["source"]].append((row["introduced"], row["fixed"], row["severity"], tuple(row["ids"]),
+                                        tuple(row.get("streams") or [])))
         else:
             pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"]])
-    order = sort_rows
-    return {"release": release.key, "format": "dpkg", "keyedBy": "source",
-            "pkgs": {k: order(v) for k, v in sorted(pkgs.items())},
-            "kernel": {k: order(v) for k, v in sorted(kernel.items())}}
+    fmt = release.format
+    body = {"release": release.key, "format": fmt, "keyedBy": _BODY_FORMATS[fmt][0],
+            "kernel": {k: sort_rows(v, fmt) for k, v in sorted(kernel.items())}}
+    if not rpm:
+        body["pkgs"] = {k: sort_rows(v, fmt) for k, v in sorted(pkgs.items())}
+        return body
+    fixes = sorted([list(f) for f in {f for v in pkgs.values() for f in v}], key=functools.cmp_to_key(
+        lambda a, b: rpmver.compare(a[1], b[1]) or _version_or_zero_cmp(a[0], b[0], fmt)
+        or (a[1] > b[1]) - (a[1] < b[1]) or (a[2] > b[2]) - (a[2] < b[2]) or (a[3] > b[3]) - (a[3] < b[3])
+        or (a[4] > b[4]) - (a[4] < b[4]) or (a[0] > b[0]) - (a[0] < b[0])))
+    ids = sorted({i for f in fixes for i in f[3]})
+    id_index = {cve: n for n, cve in enumerate(ids)}
+    fix_index = {tuple(f): n for n, f in enumerate(fixes)}
+    body["ids"] = ids
+    body["fixes"] = [[f[0], f[1], f[2], [id_index[i] for i in f[3]], list(f[4])] for f in fixes]
+    body["pkgs"] = {k: sorted({fix_index[f] for f in v}) for k, v in sorted(pkgs.items())}
+    return body
 
 
-def _version_or_zero_cmp(a, b):
+def prune_superseded(rows, keep):
+    """S5, only for an rpm file over FILE_CAP: per (binary, modular build or not, streams, introduced) the newest
+    `keep` fixes stay and older ones go. A host below an older fix is below every newer one too, so a finding never
+    disappears; it lists fewer CVEs ("at least") and can show a lower severity than an older Critical fix. Kernel
+    rows are never pruned. Returns (rows, number dropped)."""
+    groups = collections.defaultdict(list)
+    out = []
+    for row in rows:
+        if row["kernel"]:
+            out.append(row)
+            continue
+        groups[(row["source"], rpmver.is_modular(row["fixed"]), tuple(row.get("streams") or []),
+                row["introduced"])].append(row)
+    dropped = 0
+    for group in groups.values():
+        group.sort(key=lambda r: rpmver.sort_key(r["fixed"]))
+        out.extend(group[-keep:])
+        dropped += max(0, len(group) - keep)
+    return out, dropped
+
+
+PRUNE_STEPS = (16, 12, 10, 8, 6, 5, 4, 3)
+
+
+def version_cmp(fmt):
+    """The comparison (a, b) -> -1/0/1 of a release format."""
+    if fmt == "apk":
+        return apkver.compare
+    if fmt == "rpm":
+        return rpmver.compare
+    return lambda a, b: DpkgVersion.parse(a)._cmp(DpkgVersion.parse(b))
+
+
+def version_ok(fmt, text):
+    """A valid version of the format, not date-shaped (what check_release_body and the rules accept)."""
+    if not isinstance(text, str) or _DATE_SHAPED.match(text):
+        return False
+    if fmt == "rpm":
+        return rpmver.validate(text)
+    return apkver.validate(text) if fmt == "apk" else _cmp_ok(text) is not None
+
+
+def _version_or_zero_cmp(a, b, fmt="dpkg"):
     """Compares two `introduced` values: "0" is below every version."""
     if a == b:
         return 0
@@ -669,34 +1186,46 @@ def _version_or_zero_cmp(a, b):
         return -1
     if b == "0":
         return 1
-    return DpkgVersion.parse(a)._cmp(DpkgVersion.parse(b))
+    return version_cmp(fmt)(a, b)
 
 
-def sort_rows(rows):
-    """Rows ordered by fixed version, then introduced."""
+def sort_rows(rows, fmt="dpkg"):
+    """Rows ordered by fixed version, then introduced (then the text, so equal apk versions sort stably)."""
+    cmp = version_cmp(fmt)
     return sorted(rows, key=functools.cmp_to_key(
-        lambda a, b: DpkgVersion.parse(a[1])._cmp(DpkgVersion.parse(b[1])) or _version_or_zero_cmp(a[0], b[0])))
+        lambda a, b: cmp(a[1], b[1]) or _version_or_zero_cmp(a[0], b[0], fmt)
+        or (a[1] > b[1]) - (a[1] < b[1]) or (a[0] > b[0]) - (a[0] < b[0])))
 
 
 _ID = re.compile(r"^(CVE-\d{4}-\d{4,}|(USN|DSA|DLA|DTSA|LSN)-\d+(-\d+)?|(UBUNTU|DEBIAN)-CVE-\d{4}-\d{4,})$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Per format: (keyedBy, id pattern). apk ids are upstream CVEs only.
+_BODY_FORMATS = {"dpkg": ("source", _ID), "apk": ("origin", _CVE), "rpm": ("binary", _CVE)}
+# S5: a module stream in an rpm row (`php:8.1`, `virt-devel:rhel`).
+_STREAM_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+FORMAT_OF = {r.key: r.format for r in RELEASES}
 
 
 def check_release_body(body, key, entry):
     """Raises FeedError unless a release file has the plan 4.1 shape and matches its manifest entry."""
     def fail(why):
         raise FeedError(f"{entry['file']}: {why}")
-    if not isinstance(body, dict) or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
-        fail("keys must be release, format, keyedBy, pkgs, kernel")
-    if body["release"] != key or body["format"] != entry["format"] or body["format"] != "dpkg" \
-            or body["keyedBy"] != "source":
+    fmt = entry["format"]
+    want = {"release", "format", "keyedBy", "pkgs", "kernel"} | ({"ids", "fixes"} if fmt == "rpm" else set())
+    if not isinstance(body, dict) or set(body) != want:
+        fail("keys must be " + ", ".join(sorted(want)))
+    if body["release"] != key or body["format"] != fmt or fmt not in _BODY_FORMATS \
+            or FORMAT_OF.get(key, fmt) != fmt or body["keyedBy"] != _BODY_FORMATS[fmt][0]:
         fail("release/format/keyedBy do not match the manifest")
+    id_re = _BODY_FORMATS[fmt][1]
     count = 0
-    for section, width in (("pkgs", 4), ("kernel", 5)):
+    if fmt == "rpm":
+        count += _check_rpm_tables(body, fail)
+    for section, width in ((("kernel", 5),) if fmt == "rpm" else (("pkgs", 4), ("kernel", 5))):
         if not isinstance(body[section], dict):
             fail(f"{section} is not an object")
         for source, rows in body[section].items():
-            if not _SOURCE_NAME.match(source) or (section == "kernel") != is_kernel(source):
+            if not name_ok(source, fmt) or (section == "kernel") != is_kernel(source, fmt):
                 fail(f"bad {section} source {source!r}")
             if not isinstance(rows, list) or not rows:
                 fail(f"{source}: no rows")
@@ -705,22 +1234,70 @@ def check_release_body(body, key, entry):
                 if not isinstance(row, list) or len(row) != width:
                     fail(f"{source}: row {row!r} is not {width} fields")
                 introduced, fixed, sev = row[0], row[1], row[2]
-                if not (introduced == "0" or _cmp_ok(introduced)) or not isinstance(fixed, str) \
-                        or _cmp_ok(fixed) is None or _DATE_SHAPED.match(fixed):
+                intro_ok = introduced == "0" or (version_ok(fmt, introduced) if fmt in ("apk", "rpm")
+                                                 else _cmp_ok(introduced) is not None)
+                if not intro_ok or not version_ok(fmt, fixed):
                     fail(f"{source}: bad version in {row!r}")
                 if type(sev) is not int or sev not in (cvss.HIGH, cvss.CRITICAL):
                     fail(f"{source}: severity {sev!r} is not High or Critical")
                 if section == "pkgs":
                     ids = row[3]
                     if not isinstance(ids, list) or not ids or ids != sorted(set(ids)) \
-                            or not all(isinstance(i, str) and _ID.match(i) for i in ids):
+                            or not all(isinstance(i, str) and id_re.match(i) for i in ids):
                         fail(f"{source}: bad ids {ids!r}")
                 else:
+                    # apk kernel rows always carry a null date (no fix date in OSV Alpine).
                     if type(row[3]) is not int or row[3] < 1 or not (row[4] is None or (
-                            isinstance(row[4], str) and _DAY.match(row[4]))):
+                            fmt in ("dpkg", "rpm") and isinstance(row[4], str) and _DAY.match(row[4]))):
                         fail(f"{source}: bad kernel row {row!r}")
     if count != entry["rows"]:
         fail(f"{count} rows, the manifest says {entry['rows']}")
+
+
+def _check_rpm_tables(body, fail):
+    """The compact rpm tables (release_body): `ids` sorted unique CVEs; every fix well formed, sorted by fixed EVR,
+    referenced by some binary, its id indexes sorted, unique and in range, its streams only on a modular fix; every
+    binary a valid name (never a kernel binary) with sorted unique fix indexes in range. Returns the row count."""
+    ids, fixes, pkgs = body["ids"], body["fixes"], body["pkgs"]
+    if not isinstance(ids, list) or ids != sorted(set(ids)) or not all(isinstance(i, str) and _CVE.match(i)
+                                                                        for i in ids):
+        fail("bad ids table")
+    if not isinstance(fixes, list) or not isinstance(pkgs, dict):
+        fail("fixes is not a list or pkgs is not an object")
+    used_ids = set()
+    for fix in fixes:
+        if not isinstance(fix, list) or len(fix) != 5:
+            fail(f"fix {fix!r} is not 5 fields")
+        introduced, fixed, sev, refs, streams = fix
+        if not (introduced == "0" or version_ok("rpm", introduced)) or not version_ok("rpm", fixed):
+            fail(f"bad version in fix {fix!r}")
+        if type(sev) is not int or sev not in (cvss.HIGH, cvss.CRITICAL):
+            fail(f"fix {fix!r}: severity is not High or Critical")
+        if not isinstance(refs, list) or not refs or refs != sorted(set(refs)) \
+                or not all(type(r) is int and 0 <= r < len(ids) for r in refs):
+            fail(f"fix {fix!r}: bad id indexes")
+        used_ids.update(refs)
+        if not isinstance(streams, list) or streams != sorted(set(streams)) \
+                or not all(isinstance(x, str) and len(x) <= STREAM_MAX and _STREAM_VALUE.match(x) for x in streams) \
+                or (streams and not rpmver.is_modular(fixed)):
+            fail(f"fix {fix!r}: bad streams")
+    for a, b in zip(fixes, fixes[1:]):
+        if rpmver.compare(a[1], b[1]) > 0:
+            fail("fixes are not sorted by fixed EVR")
+    if len(used_ids) != len(ids):
+        fail("an id no fix names")
+    count, used_fixes = 0, set()
+    for name, refs in pkgs.items():
+        if not name_ok(name, "rpm") or is_rpm_kernel_family(name):
+            fail(f"bad pkgs binary {name!r}")
+        if not isinstance(refs, list) or not refs or refs != sorted(set(refs)) \
+                or not all(type(r) is int and 0 <= r < len(fixes) for r in refs):
+            fail(f"{name}: bad fix indexes")
+        used_fixes.update(refs)
+        count += len(refs)
+    if len(used_fixes) != len(fixes):
+        fail("a fix no binary names")
+    return count
 
 
 def body_bytes(body):
@@ -754,6 +1331,163 @@ def read_inventory(path):
             if old is None or DpkgVersion.parse(version) > DpkgVersion.parse(old):
                 out[source] = version
     return out
+
+
+def read_apk_inventory(path):
+    """{origin: highest version} from the app's Pro probe listing of /lib/apk/db/installed (`grep -E
+    "^([PVo]:|$)"`: the P: name, V: version and o: origin lines and the blank record separators, in file
+    order). A record's origin is its `o:`, else its name; per origin the HIGHEST version (by apkver) of its
+    packages counts (plan 3.3). `#` lines are comments."""
+    out = {}
+    record = {}
+
+    def flush():
+        if not record:
+            return
+        name, version = record.get("P"), record.get("V")
+        if not name or not version:
+            raise FeedError(f"{os.path.basename(path)}: a record without P: or V: ({record!r:.80})")
+        origin = record.get("o") or name
+        old = out.get(origin)
+        if old is None or apkver.compare(version, old) > 0:
+            out[origin] = version
+        record.clear()
+
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                continue
+            if not line:
+                flush()
+                continue
+            if len(line) < 2 or line[1] != ":" or line[0] not in "PVo":
+                raise FeedError(f"{os.path.basename(path)}: bad line {line[:60]!r}")
+            if line[0] in record:
+                raise FeedError(f"{os.path.basename(path)}: {line[0]}: twice in one record")
+            record[line[0]] = line[2:]
+    flush()
+    return out
+
+
+def read_rpm_inventory(path):
+    """{binary: (EVR, source rpm name, modularity label or None)} from the app's Pro probe rpm listing (`rpm -qa
+    --qf "%{NAME}\\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\\t%{ARCH}\\t%{SOURCERPM}\\t%{MODULARITYLABEL}\\n"`). Per name the
+    HIGHEST EVR counts (several arches, several kernels); `gpg-pubkey` (arch `(none)`) and a row that does not parse
+    are skipped, as the app's parser skips them. `#` lines are comments."""
+    out = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) != 5:
+                raise FeedError(f"{os.path.basename(path)}: bad line {line[:60]!r}")
+            name, evr, arch, srpm, label = parts
+            if arch == "(none)" or not name_ok(name, "rpm") or not rpmver.validate(evr):
+                continue
+            old = out.get(name)
+            if old is None or rpmver.compare(evr, old[0]) > 0:
+                out[name] = (evr, source_rpm_name(srpm) or name,
+                         label if label and label != "(none)" and len(label) <= LABEL_MAX else None)
+    return out
+
+
+def source_rpm_name(srpm):
+    """`openssl-3.0.7-27.el9.src.rpm` -> `openssl`; None for `(none)` or anything else."""
+    if not isinstance(srpm, str) or not srpm.endswith(".src.rpm"):
+        return None
+    parts = srpm[:-len(".src.rpm")].rsplit("-", 2)
+    return parts[0] if len(parts) == 3 and name_ok(parts[0], "rpm") else None
+
+
+def label_stream(label):
+    """`php:8.2:9020020230608123456:abcd1234` (MODULARITYLABEL) -> `php:8.2`; None without one."""
+    if not label:
+        return None
+    parts = label.split(":")
+    return f"{parts[0]}:{parts[1]}" if len(parts) >= 2 and parts[0] and parts[1] else None
+
+
+def rpm_stream_ok(fixed, streams, installed, label):
+    """S5, plan 3.4: whether an rpm row may be compared with this installed build at all. A modular row only with a
+    modular build of the SAME stream (the host's MODULARITYLABEL name:stream is one of the row's streams; with no
+    label or no stream on the row, the upstream major.minor must agree: a php 8.2 host never meets a php:8.1 row),
+    and a plain row only with a plain build. The app's PackageMatcher is the twin."""
+    row_modular, host_modular = rpmver.is_modular(fixed), rpmver.is_modular(installed)
+    if row_modular != host_modular:
+        return False
+    if not row_modular:
+        return True
+    host = label_stream(label)
+    if streams and host:
+        return host in streams
+    mm = rpmver.upstream_major_minor(fixed)
+    return mm is not None and mm == rpmver.upstream_major_minor(installed)
+
+
+# The /etc/os-release ID of the vendor whose own builds each EL release file carries (S6, review HIGH).
+EL_FILE_VENDOR = {"rhel": "rhel", "alma": "almalinux"}
+
+
+def rpm_rebuild(host_id, key):
+    """Whether a host with /etc/os-release ID `host_id` is a REBUILD host for EL release file `key`: one matched
+    against another vendor's builds (Rocky Linux, `rocky`, against rhel-*). A RHEL host (`rhel`) against rhel-* and an
+    AlmaLinux host (`almalinux`) against alma-* are not: their files carry their own vendor's module build ids, so
+    rpmver.match_compare compares them plainly."""
+    return host_id != EL_FILE_VENDOR[key.split("-", 1)[0]]
+
+
+def case_rebuild(case):
+    """rpm_rebuild for an EL golden case (its `host`: the fixture's /etc/os-release ID)."""
+    return rpm_rebuild(case["host"], case["release"])
+
+
+def rpm_hits(rows, inventory, capture, rebuild=False):
+    """{source rpm: [fixed, ...]} for the non-kernel rows published before `capture` that an installed binary is
+    affected by (introduced <= installed < fixed, the stream rule), grouped by the binary's source rpm as the app
+    groups its findings. `rebuild` (rpm_rebuild) selects rpmver.match_compare's rebuild mode."""
+    hits = collections.defaultdict(list)
+    for row in rows:
+        if row["kernel"] or not published_before(row, capture):
+            continue
+        entry = inventory.get(row["source"])
+        if entry is None:
+            continue
+        installed, group, label = entry
+        if not rpm_stream_ok(row["fixed"], row.get("streams") or [], installed, label):
+            continue
+        # S6 (review HIGH): plain EVR order for a host against its own vendor's file; a rebuild host (Rocky against
+        # rhel-*) compares modular builds without their module build ids (review M1), as the app does.
+        if row["introduced"] != "0" and rpmver.match_compare(installed, row["introduced"], rebuild) < 0:
+            continue
+        if rpmver.match_compare(installed, row["fixed"], rebuild) < 0:
+            hits[group].append(row["fixed"])
+    return dict(hits)
+
+
+def read_case_inventory(path, fmt):
+    if fmt == "rpm":
+        return read_rpm_inventory(path)
+    return read_apk_inventory(path) if fmt == "apk" else read_inventory(path)
+
+
+def apk_hits(body, inventory):
+    """{origin: [fixed, ...]} for the package rows of an apk release FILE that the inventory is in: a row
+    matches when introduced <= installed < fixed (introduced "0" always holds). Kernel rows are not counted.
+    This is exactly the app's matcher, on the shipped file (Alpine rows carry no fix date to filter on)."""
+    hits = collections.defaultdict(list)
+    for origin, rows in body["pkgs"].items():
+        installed = inventory.get(origin)
+        if installed is None:
+            continue
+        for introduced, fixed, _, _ in rows:
+            if introduced != "0" and apkver.compare(installed, introduced) < 0:
+                continue
+            if apkver.compare(installed, fixed) < 0:
+                hits[origin].append(fixed)
+    return dict(hits)
 
 
 def published_before(row, capture):
@@ -848,21 +1582,37 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
     more unexpected sources, or any unexpected hit whose High came from a HEURISTIC_RULES rule (per-id
     provenance is in each row's `rules`), fail."""
     failures = []
+    fmt = FORMAT_OF.get(key, "dpkg")
     for case in golden_cases(golden_dir):
         if case["release"] != key:
             continue
-        inventory = read_inventory(os.path.join(golden_dir, case["fixture"]))
-        at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
-        hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)
+        inventory = read_case_inventory(os.path.join(golden_dir, case["fixture"]), fmt)
+        if fmt == "apk":
+            # No fix dates and no archive at capture: the shipped rows, matched as the app does.
+            hits, unarchived = apk_hits(release_body(Release(key, "alpine", None, None), rows), inventory), []
+        elif fmt == "rpm":
+            # Advisory dates, no archive: the rows published before capture, matched as the app does.
+            hits, unarchived = rpm_hits(rows, inventory, case["capture"], case_rebuild(case)), []
+        else:
+            at_capture = read_inventory(os.path.join(golden_dir, case["archive"])) if case.get("archive") else None
+            hits, unarchived = golden_hits(rows, inventory, case["capture"], at_capture)
         got = set(hits)
         expected = set(case.get("exact", case.get("atLeast", [])))
-        detail = ", ".join(f"{s} {inventory[s]} < {max(hits[s], key=sort_key)}" for s in sorted(got)) or "none"
+        key_of = {"apk": apkver.sort_key, "rpm": rpmver.sort_key}.get(fmt, sort_key)
+
+        def shown(group):
+            if fmt != "rpm":
+                return inventory[group]
+            return min((e[0] for e in inventory.values() if e[1] == group), key=rpmver.sort_key, default="?")
+        detail = ", ".join(f"{s} {shown(s)} < {max(hits[s], key=key_of)}" for s in sorted(got)) or "none"
         if expected - got:
             failures.append(f"golden {case['fixture']}: missing {sorted(expected - got)} [{detail}]")
         if unarchived:
             failures.append(f"golden {case['fixture']}: hits on sources not in {case['archive']}: "
                             + ", ".join(unarchived[:5]))
-        extra = sorted(got - expected) if "exact" in case else []
+        # apk `atLeast` cases are limited too (M1): with no fix dates a frozen image gains real hits, but 3 or more
+        # unexpected origins at once is a matcher or data problem, not drift.
+        extra = sorted(got - expected) if ("exact" in case or fmt in ("apk", "rpm")) else []
         if extra:
             weak = sorted({f"{row['source']} ({rule})" for row in rows if row["source"] in extra
                            and row["fixed"] in hits[row["source"]]
@@ -874,11 +1624,14 @@ def check_golden(key, rows, log, golden_dir=GOLDEN_DIR):
                 failures.append(f"golden {case['fixture']}: unexpected hit(s) rated High by a heuristic rule, "
                                 f"not a score: {', '.join(weak)}")
             else:
-                log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; OSV re-rated or added a "
-                         "fix that was in the archive at capture; update expected.json if it is right)")
+                why = {"apk": "a new secdb fix for a frozen image",
+                       "rpm": "OSV re-rated an advisory or added one dated before the capture"}.get(
+                    fmt, "OSV re-rated or added a fix that was in the archive at capture")
+                log.warn(f"golden {case['fixture']}: also flags {extra} (not expected; {why}; update "
+                         "expected.json if it is right)")
         if not failures:
-            log.info(f"golden {case['fixture']} ({key}, before {case['capture']}): {len(got)} source(s) "
-                     f"flagged: {detail}")
+            when = "every shipped row, no fix dates" if fmt == "apk" else f"before {case['capture']}"
+            log.info(f"golden {case['fixture']} ({key}, {when}): {len(got)} source(s) flagged: {detail}")
     return failures
 
 
@@ -1012,7 +1765,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
 
     archives, baselines = {}, {}
     for release in releases:
-        if release.esm or release.key in archives:
+        if release.esm or release.key in archives or not release.has_archive:
             continue
         baseline_file = None
         if release.family == "debian":
@@ -1064,7 +1817,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 log.info(f"osv {zip_name}: {key} {value}")
         if shapes:
             log.info(f"osv {zip_name}: unknown shapes, e.g. " + "; ".join(shapes[:5]))
-        zip_fixed = zip_rejected = 0
+        zip_fixed = zip_rejected = zip_intro = zip_events = 0
         pending = {}
         for release in members:
             try:
@@ -1072,13 +1825,22 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                                                     baselines, work, log)
                 zip_fixed += len(candidates[release.key])
                 zip_rejected += pending[release.key]["rejected"]
+                zip_intro += pending[release.key]["intro_zeroed"]
+                zip_events += pending[release.key]["fixed_events"]
             except _SOFT as error:
                 fail([release.key], soft_reason("build", error))
         share = zip_rejected / zip_fixed if zip_fixed else 0.0
-        log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})")
+        intro_share = zip_intro / zip_events if zip_events else 0.0
+        log.info(f"osv {zip_name}: rejected {zip_rejected} of {zip_fixed} fixed rows ({share:.3%})"
+                 + (f"; {zip_intro} of {zip_events} fixed range events had an unparseable introduced read as "
+                    f"\"0\" ({intro_share:.3%})" if zip_intro else ""))
         if share >= REJECT_LIMIT:
             fail(list(pending), f"osv {zip_name}: {share:.2%} of fixed versions rejected, the limit is "
                                 f"{REJECT_LIMIT:.1%}")
+            continue
+        if intro_share >= INTRODUCED_REJECT_LIMIT:
+            fail(list(pending), f"osv {zip_name}: {intro_share:.2%} of range events had an unparseable "
+                                f"introduced (read as \"0\"), the limit is {INTRODUCED_REJECT_LIMIT:.1%}")
             continue
         for key, built in sorted(pending.items()):
             problems = []
@@ -1086,7 +1848,7 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
                 problems.append(f"{built['unknown']} unknown range shape(s) (fail closed)")
             if len(built["data"]) > FILE_CAP:
                 problems.append(f"{len(built['data'])} bytes, over the {FILE_CAP}-byte cap")
-            entry = {"format": "dpkg", "file": "r/" + content_name(key, built["data"]),
+            entry = {"format": built["format"], "file": "r/" + content_name(key, built["data"]),
                      "sha256": sha256_hex(built["data"]), "bytes": len(built["data"]), "rows": built["count"]}
             try:
                 check_release_body(json.loads(built["data"]), key, entry)
@@ -1100,6 +1862,12 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
             if problems:
                 fail([key], "; ".join(problems))
                 continue
+            headroom = 1 - len(built["data"]) / FILE_CAP
+            if headroom < CAP_HEADROOM_WARN:
+                # Review L1: the next few hundred rows would push it over (and an rpm file into the fit-to-cap
+                # prune); worth a look before it fails.
+                log.warn(f"{key}: {len(built['data'])} bytes, {headroom:.1%} under the {FILE_CAP}-byte cap "
+                         f"(warns below {CAP_HEADROOM_WARN:.0%})")
             with open(os.path.join(site_v1, entry["file"]), "wb") as handle:
                 handle.write(built["data"])
             out[key] = entry
@@ -1110,9 +1878,27 @@ def build_releases(site_v1, log, cache, work, previous=None, offline=False, rele
 def _one_release(release, cands, info, stats, archives, baselines, work, log):
     counters, decisions = collections.Counter(), collections.Counter()
     base = release.base_key
-    rows, examples, dropped = resolve(release, cands, info, archives[base], baselines[base], counters, decisions)
+    if release.has_archive:
+        rows, examples, dropped = resolve(release, cands, info, archives[base], baselines[base], counters,
+                                          decisions)
+    elif release.format == "rpm":
+        rows, examples, dropped = resolve_rpm(release, cands, info, counters, decisions)
+    else:
+        rows, examples, dropped = resolve_apk(release, cands, info, counters, decisions)
     body = release_body(release, rows)
     data = body_bytes(body)
+    if release.format == "rpm" and len(data) > FILE_CAP:
+        # S5: fit the cap by keeping fewer superseded fixes per binary (prune_superseded), the most that fits.
+        for keep in PRUNE_STEPS:
+            pruned, gone = prune_superseded(rows, keep)
+            candidate = body_bytes(release_body(release, pruned))
+            if len(candidate) <= FILE_CAP:
+                log.info(f"{release.key}: {len(data)} bytes is over the {FILE_CAP}-byte cap: kept the newest {keep} "
+                         f"fixes per binary and stream, {gone} older superseded rows dropped, {len(candidate)} bytes")
+                counters[f"superseded rows pruned to fit the cap (newest {keep} kept)"] = gone
+                rows, data = pruned, candidate
+                body = release_body(release, rows)
+                break
     summary = {k.split(": ", 1)[1]: v for k, v in stats.items() if k.startswith(release.key + ": ")}
     log.info(f"{release.key}: {len(cands)} distinct fixed rows; "
              + ", ".join(f"{k} {v}" for k, v in sorted(counters.items()) if not k.startswith("rejected:"))
@@ -1124,6 +1910,16 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         log.info(f"{release.key}: rejected {counters['rejected']} ("
                  + ", ".join(f"{k[10:]} {v}" for k, v in sorted(counters.items()) if k.startswith("rejected: "))
                  + "), e.g. " + "; ".join(examples[:4]))
+    if release.format == "apk":
+        # Per release (the INTRODUCED_REJECT_LIMIT gate is zip-wide, as REJECT_LIMIT is): one release's share.
+        events = stats[f"{release.key}: fixed rows"]
+        zeroed = stats[f"{release.key}: {INTRO_ZEROED}"]
+        log.info(f"{release.key}: introduced: {stats[f'{release.key}: {INTRO_NORMALISED}']} normalised to the "
+                 f"dotted form, {stats[f'{release.key}: {INTRO_DASH_ZERO}']} X.Y.Z-0 read as X.Y.Z, "
+                 f"{stats[f'{release.key}: {INTRO_REOPENED}']} range(s) restarted after a bad fix, "
+                 f"{zeroed} unparseable read as \"0\" ({zeroed / events if events else 0:.3%} of its "
+                 f"{events} fixed range events); {stats[f'{release.key}: {NOT_AFFECTED}']} not-affected range(s) "
+                 f"dropped; {stats[f'{release.key}: {BAD_FIXED}']} bad fixed event(s) kept apart")
     kernels = sorted({r["source"] for r in rows if r["kernel"]})
     if kernels:
         log.info(f"{release.key}: kernel sources folded ({len(kernels)}): {' '.join(kernels)}")
@@ -1131,4 +1927,6 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         json.dump({"release": release.key, "counters": counters, "decisions": decisions,
                    "osv": summary, "rows": rows, "dropped": dropped}, handle, indent=0, sort_keys=True)
     return {"rows": rows, "data": data, "count": row_count(body), "rejected": counters["rejected"],
+            "format": release.format, "intro_zeroed": stats[f"{release.key}: {INTRO_ZEROED}"],
+            "fixed_events": stats[f"{release.key}: fixed rows"],
             "unknown": stats[f"{release.key}: unknown range shape"]}

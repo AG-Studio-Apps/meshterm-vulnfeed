@@ -1,0 +1,6 @@
+# SYNTHETIC (no real host, no image): an AlmaLinux 9 listing in the app's Pro probe rpm format with the php:8.2 module
+# stream installed at php 8.2.31-1.module_el9.8.0+254+5708f44c (MODULARITYLABEL php:8.2:9080020260601000000:5708f44c). Plan 3.4: never matched by php:8.1 or php:8.3 rows.
+php	0:8.2.31-1.module_el9.8.0+254+5708f44c	x86_64	php-8.2.31-1.module_el9.8.0+254+5708f44c.src.rpm	php:8.2:9080020260601000000:5708f44c
+php-cli	0:8.2.31-1.module_el9.8.0+254+5708f44c	x86_64	php-8.2.31-1.module_el9.8.0+254+5708f44c.src.rpm	php:8.2:9080020260601000000:5708f44c
+php-common	0:8.2.31-1.module_el9.8.0+254+5708f44c	x86_64	php-8.2.31-1.module_el9.8.0+254+5708f44c.src.rpm	php:8.2:9080020260601000000:5708f44c
+bash	0:5.1.8-9.el9	x86_64	bash-5.1.8-9.el9.src.rpm	(none)

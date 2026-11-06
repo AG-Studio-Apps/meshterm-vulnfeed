@@ -33,6 +33,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from feedlib import (FILE_CAP, FILE_RE, GENERATED_RE, KEEP_BUILDS, MANIFEST_CAP, MANIFEST_SCHEMA,  # noqa: E402
                      FeedError, content_name, dumps, is_int, loads_strict, sha256_hex)
+import eol  # noqa: E402
 import osvfeed  # noqa: E402
 import validate_curated  # noqa: E402
 
@@ -40,7 +41,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 MANIFEST_KEYS = {"schema", "version", "serial", "generated", "sources", "releases", "curated"}
 RELEASE_KEYS = {"format", "file", "sha256", "bytes", "rows"}
+# S6: an entry may also carry `eol` (and a base Ubuntu one `eolPro`), exactly as builder/eol.py's table says.
+RELEASE_OPTIONAL_KEYS = set(eol.FIELDS)
 RELEASE_FORMATS = ("dpkg", "apk", "rpm")
+OSV_ZIPS = ("Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # A live serial this far above the builds/ history is not a missed commit; stop and look.
@@ -298,10 +302,16 @@ def check_manifest(manifest):
     for key, entry in releases.items():
         if key not in osvfeed.RELEASE_KEYS:
             raise FeedError(f"release key {key!r} is not in the allowlist")
-        if not isinstance(entry, dict) or set(entry) != RELEASE_KEYS:
-            raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)}")
-        if entry["format"] not in RELEASE_FORMATS:
-            raise FeedError(f"release {key}: format must be one of {RELEASE_FORMATS}")
+        if not isinstance(entry, dict) or not RELEASE_KEYS <= set(entry) <= RELEASE_KEYS | RELEASE_OPTIONAL_KEYS:
+            raise FeedError(f"release {key}: keys must be {sorted(RELEASE_KEYS)} plus optional "
+                            f"{sorted(RELEASE_OPTIONAL_KEYS)}")
+        problem = eol.check_fields(key, entry)
+        if problem:
+            raise FeedError(f"release {key}: {problem}")
+        if {k: entry[k] for k in eol.FIELDS if k in entry} != eol.fields(key):
+            raise FeedError(f"release {key}: eol/eolPro must be builder/eol.py's {eol.fields(key) or 'none'}")
+        if entry["format"] not in RELEASE_FORMATS or entry["format"] != osvfeed.FORMAT_OF[key]:
+            raise FeedError(f"release {key}: format must be {osvfeed.FORMAT_OF[key]!r}")
         if not isinstance(entry["file"], str) or not FILE_RE.fullmatch(entry["file"]) \
                 or not entry["file"].startswith(f"r/{key}-"):
             raise FeedError(f"release {key}: bad file name {entry['file']!r}")
@@ -336,10 +346,14 @@ def check_sources(sources, releases):
     if set(sources) != {"osv", "archive", "baseline"}:
         raise FeedError(f"sources keys {sorted(sources)} != ['archive', 'baseline', 'osv']")
     osv, archive, baseline = sources["osv"], sources["archive"], sources["baseline"]
-    if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu"} \
+    if not isinstance(osv, dict) or not osv or not set(osv) <= set(OSV_ZIPS) \
             or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in osv.values()):
-        raise FeedError("sources.osv must map Debian/Ubuntu to a UTC time")
-    if not isinstance(archive, dict) or not archive or len(archive) > 64 \
+        raise FeedError("sources.osv must map Debian/Ubuntu/Alpine/AlmaLinux/Red Hat to a UTC time")
+    # Alpine (apk) and EL (rpm) releases have no archive Sources and no baseline: archive may be empty only
+    # without dpkg.
+    needs_archive = not isinstance(releases, dict) or any(
+        not isinstance(e, dict) or e.get("format") not in ("apk", "rpm") for e in releases.values())
+    if not isinstance(archive, dict) or (needs_archive and not archive) or len(archive) > 64 \
             or not all(isinstance(k, str) and SUITE_RE.fullmatch(k) for k in archive) \
             or not all(isinstance(v, str) and ISO_Z_RE.fullmatch(v) for v in archive.values()):
         raise FeedError("sources.archive must map suite names to UTC times")
@@ -432,6 +446,7 @@ def build(repo_root, out_dir, commit, now, live_manifest=None, carry_base=None, 
     releases, sources, failures = build_releases(site_v1, log, options, previous, now[:10], now, previous_dates)
     seen_dates = dict(sources.get("archive") or {})
     stale = carry_forward(past, failures, releases, sources, site_v1, carry_base, now, log)
+    eol.apply(releases)     # S6: from the reviewed table, carried-forward entries too (never an old record's value)
     if not releases:
         sources = {}
 

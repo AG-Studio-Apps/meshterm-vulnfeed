@@ -161,7 +161,8 @@ class GateTests(unittest.TestCase):
         with open(os.path.join(self.v1, name), "wb") as handle:
             handle.write(big)
         manifest["releases"] = {"ubuntu-24.04": {"format": "dpkg", "file": name, "sha256": digest,
-                                                 "bytes": len(big), "rows": 1}}
+                                                 "bytes": len(big), "rows": 1,
+                                                 "eol": "2029-05-31", "eolPro": "2034-04-25"}}
         manifest["sources"] = helpers.FAKE_SOURCES
         self.rewrite(manifest)
         with self.assertRaisesRegex(FeedError, "at most"):
@@ -213,7 +214,8 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_entry_and_sources(self):
         entry = self.manifest["releases"]["debian-12"]
-        self.assertEqual(set(entry), {"format", "file", "sha256", "bytes", "rows"})
+        self.assertEqual(set(entry), {"format", "file", "sha256", "bytes", "rows", "eol"})
+        self.assertEqual(entry["eol"], "2028-06-30")
         with open(os.path.join(self.v1, entry["file"]), "rb") as handle:
             data = handle.read()
         self.assertEqual(hashlib.sha256(data).hexdigest(), entry["sha256"])

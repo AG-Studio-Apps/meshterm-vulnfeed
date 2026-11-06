@@ -2,12 +2,25 @@
  "note": [
   "Per-release row floors for the row-count gate (builder/osvfeed.py row_gate). A release below",
   "max(this, half its previous count) is not published; its previous file is carried forward. Set 2026-11-05",
-  "to half of the first S2 build's counts. A new release needs an entry here."
+  "to half of the first S2 build's counts. A new release needs an entry here.",
+  "Alpine (S4) set 2026-11-05 to half of the first local S4 build's counts (2286, 2347, 2486, 2650, 2636).",
+  "EL (S5) set 2026-11-05 to half of the local S5 build's counts after review H1 (RHEL rated by Red Hat's own advisory rating) and L2 (kernel userspace binaries dropped): 11291, 9148, 3613; 13757, 9365, 4005 (rhel-8 fits the cap unpruned now)."
  ],
  "minimums": {
+  "alma-10": 1806,
+  "alma-8": 5645,
+  "alma-9": 4574,
+  "alpine-3.20": 1143,
+  "alpine-3.21": 1173,
+  "alpine-3.22": 1243,
+  "alpine-3.23": 1325,
+  "alpine-3.24": 1318,
   "debian-11": 568,
   "debian-12": 596,
   "debian-13": 347,
+  "rhel-10": 2002,
+  "rhel-8": 6878,
+  "rhel-9": 4682,
   "ubuntu-20.04": 875,
   "ubuntu-20.04-esm": 261,
   "ubuntu-22.04": 1004,

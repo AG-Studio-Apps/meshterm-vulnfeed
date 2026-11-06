@@ -156,7 +156,7 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          read -r serial date < <(python3 -c 'import json; m = json.load(open("out/v1/manifest.json")); print(m["serial"], m["generated"][:10])')
+          read -r serial date < <(python3 -I -c 'import json; m = json.load(open("out/v1/manifest.json")); print(m["serial"], m["generated"][:10])')
           echo "serial=$serial" >> "$GITHUB_OUTPUT"
           echo "date=$date" >> "$GITHUB_OUTPUT"
           # Releases whose S2 failure was a builder bug (not upstream): published as carried forward, then the
@@ -212,7 +212,7 @@ jobs:
           ENV_JSON=$(api "repos/$GITHUB_REPOSITORY/environments/vulnfeed-signing")
           POLICIES_JSON=$(api "repos/$GITHUB_REPOSITORY/environments/vulnfeed-signing/deployment-branch-policies")
           export ENV_JSON POLICIES_JSON
-          python3 - <<'PY'
+          python3 -I - <<'PY'
           import json, os, sys
           env = json.loads(os.environ["ENV_JSON"])
           policies = json.loads(os.environ["POLICIES_JSON"])
@@ -260,7 +260,7 @@ jobs:
           export SITE="$site"
           [[ "$SERIAL" =~ ^[1-9][0-9]*$ ]] || { echo "::error::bad serial '$SERIAL'"; exit 1; }
           python3 -I - <<'PY'
-          import hashlib, json, os, re, sys
+          import datetime, hashlib, json, os, re, sys
           site, serial, date = os.environ["SITE"], int(os.environ["SERIAL"]), os.environ["DATE"]
           def pairs(items):
               keys = [k for k, _ in items]
@@ -286,11 +286,47 @@ jobs:
           # release; builder/osvfeed.py check_release_body() did the full schema check in the build job.
           allow = {"ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                    "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
-                   "debian-11", "debian-12", "debian-13"}
+                   "debian-11", "debian-12", "debian-13",
+                   "alpine-3.20", "alpine-3.21", "alpine-3.22", "alpine-3.23", "alpine-3.24",
+                   "alma-8", "alma-9", "alma-10", "rhel-8", "rhel-9", "rhel-10"}
+          # The format each release key must carry (S4 apk, S5 rpm; everything else dpkg).
+          def fmt_of(key):
+              return "apk" if key.startswith("alpine-") else "rpm" if key.startswith(("alma-", "rhel-")) else "dpkg"
           # Releases dropped from the feed (builder/osvfeed.py RETIRED_RELEASES): never a manifest entry, their
           # old files allowed only as carry-overs (checked against builds/ below) until they age out.
           retired = set()
           iso = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+          # S6: an entry may carry `eol` (its last supported day) and, on a base Ubuntu key only, `eolPro` (the last
+          # ESM day, never before eol); builder/eol.py's table sets them, builder/eol.py check_fields is the twin.
+          entry_keys = {"format", "file", "sha256", "bytes", "rows"}
+          def day_ok(v):
+              if not isinstance(v, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+                  return False
+              try:
+                  datetime.date.fromisoformat(v)
+              except ValueError:
+                  return False
+              return True
+          def eol_problem(key, e):
+              if "eol" in e and not day_ok(e["eol"]):
+                  return "eol is not a YYYY-MM-DD date"
+              if "eolPro" in e:
+                  if not re.fullmatch(r"ubuntu-[0-9]{2}\.[0-9]{2}", key):
+                      return "eolPro on a key that is not ubuntu-NN.NN"
+                  if not day_ok(e["eolPro"]):
+                      return "eolPro is not a YYYY-MM-DD date"
+                  if "eol" not in e or e["eolPro"] < e["eol"]:
+                      return "eolPro without eol, or before it"
+              return None
+          # S5 review L7 / S6: the EL kernel binaries (builder/osvfeed.py RPM_KERNELS: the only `kernel` keys of an
+          # rpm body) and the kernel source's other binaries, which are never `pkgs` keys (is_rpm_kernel_family:
+          # `kernel`, `kernel-*`, RPM_KERNEL_USERSPACE).
+          rpm_kernels = {"kernel-core", "kernel-rt-core", "kernel-64k-core", "kernel-debug-core",
+                         "kernel-rt-debug-core", "kernel-64k-debug-core"}
+          rpm_kernel_userspace = {"perf", "python3-perf", "python-perf", "bpftool", "rtla", "rv", "libperf",
+                                  "libperf-devel"}
+          def rpm_kernel_family(name):
+              return name == "kernel" or name.startswith("kernel-") or name in rpm_kernel_userspace
           rels = m.get("releases")
           # Empty is allowed (S2 is fail-soft: a feed with no release ever built still publishes curated).
           if not isinstance(rels, dict):
@@ -299,10 +335,13 @@ jobs:
           for key, e in sorted(rels.items()):
               if key not in allow:
                   problems.append(f"release {key!r} is not on the allowlist"); continue
-              if not isinstance(e, dict) or set(e) != {"format", "file", "sha256", "bytes", "rows"}:
+              if not isinstance(e, dict) or not entry_keys <= set(e) <= entry_keys | {"eol", "eolPro"}:
                   problems.append(f"release {key}: bad entry keys"); continue
+              why = eol_problem(key, e)
+              if why:
+                  problems.append(f"release {key}: {why}"); continue
               sha, name = e["sha256"], e["file"]
-              if e["format"] != "dpkg" or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
+              if e["format"] != fmt_of(key) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) \
                       or name != f"r/{key}-{sha[:16]}.json" \
                       or type(e["bytes"]) is not int or not 0 < e["bytes"] <= 600 * 1024 \
                       or type(e["rows"]) is not int or e["rows"] < 0:
@@ -317,9 +356,41 @@ jobs:
                   body = json.loads(data, object_pairs_hook=pairs)
               except ValueError:
                   problems.append(f"release {key}: {name} is not JSON"); continue
-              if not isinstance(body, dict) or body.get("release") != key \
-                      or set(body) != {"release", "format", "keyedBy", "pkgs", "kernel"}:
+              # An rpm body (S5) also carries its shared `ids` and `fixes` tables; its pkgs map binaries to fix indexes.
+              keys = {"release", "format", "keyedBy", "pkgs", "kernel"} | ({"ids", "fixes"} if fmt_of(key) == "rpm" else set())
+              if not isinstance(body, dict) or body.get("release") != key or set(body) != keys:
                   problems.append(f"release {key}: {name} does not name its release"); continue
+              if body.get("format") != e["format"]:
+                  problems.append(f"release {key}: {name} says format {body.get('format')!r}, the manifest {e['format']!r}"); continue
+              if fmt_of(key) == "rpm":
+                  # S5 review L7: the compact tables must hold together (the app follows these indexes): ids sorted
+                  # unique CVEs; every fix 5 fields whose id indexes are sorted, unique and in range; every binary's
+                  # fix indexes the same; no id and no fix that nothing refers to.
+                  ids_t, fixes_t, pk = body["ids"], body["fixes"], body["pkgs"]
+                  def refs_ok(refs, n):
+                      return isinstance(refs, list) and len(refs) > 0 and refs == sorted(set(refs)) \
+                          and all(type(r) is int and 0 <= r < n for r in refs)
+                  bad = None
+                  if not isinstance(ids_t, list) or ids_t != sorted(set(ids_t)) \
+                          or not all(isinstance(i, str) and re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", i) for i in ids_t):
+                      bad = "ids table"
+                  elif not isinstance(fixes_t, list) \
+                          or not all(isinstance(f, list) and len(f) == 5 and refs_ok(f[3], len(ids_t)) for f in fixes_t):
+                      bad = "fixes table"
+                  elif not all(f[2] in (3, 4) and type(f[2]) is int and isinstance(f[4], list)
+                               and all(isinstance(x, str) and len(x) <= 64 for x in f[4]) for f in fixes_t):
+                      bad = "fix severity or streams"
+                  elif not isinstance(pk, dict) or not all(refs_ok(v, len(fixes_t)) for v in pk.values()):
+                      bad = "pkgs fix indexes"
+                  elif any(not isinstance(n, str) or rpm_kernel_family(n) for n in pk):
+                      bad = "pkgs binary (a kernel binary)"
+                  elif not isinstance(body["kernel"], dict) or not set(body["kernel"]) <= rpm_kernels:
+                      bad = "kernel binary (not one of RPM_KERNELS)"
+                  elif {r for f in fixes_t for r in f[3]} != set(range(len(ids_t))) \
+                          or {r for v in pk.values() for r in v} != set(range(len(fixes_t))):
+                      bad = "table (an id or a fix nothing refers to)"
+                  if bad:
+                      problems.append(f"release {key}: {name} has a bad rpm {bad}"); continue
               try:
                   count = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
               except (AttributeError, TypeError):
@@ -334,10 +405,12 @@ jobs:
               problems.append("sources keys are not exactly osv, archive, baseline")
           else:
               osv, arc, base = src["osv"], src["archive"], src["baseline"]
-              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu"} \
+              if not isinstance(osv, dict) or not osv or not set(osv) <= {"Debian", "Ubuntu", "Alpine", "AlmaLinux", "Red Hat"} \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in osv.values()):
-                  problems.append("sources.osv is not {Debian|Ubuntu: UTC time}")
-              if not isinstance(arc, dict) or not arc or len(arc) > 64 \
+                  problems.append("sources.osv is not {Debian|Ubuntu|Alpine|AlmaLinux|Red Hat: UTC time}")
+              # Alpine and EL releases have no archive: it may be empty only when no release is a dpkg one.
+              dpkg = any(fmt_of(k) == "dpkg" for k in rels)
+              if not isinstance(arc, dict) or (dpkg and not arc) or len(arc) > 64 \
                       or not all(isinstance(k, str) and re.fullmatch(r"[a-z]+(-updates|-security)?", k) for k in arc) \
                       or not all(isinstance(v, str) and iso.fullmatch(v) for v in arc.values()):
                   problems.append("sources.archive is not {suite: UTC time}")
@@ -485,7 +558,7 @@ jobs:
             if curl -fsS --max-time 20 -H 'Cache-Control: no-cache' -o m.json "$SITE_URL/v1/manifest.json?r=$token" \
                && curl -fsS --max-time 20 -H 'Cache-Control: no-cache' -o m.json.minisig "$SITE_URL/v1/manifest.json.minisig?r=$token" \
                && minisign -V -q -p keys/vulnfeed-feed.pub -m m.json -x m.json.minisig; then
-              live=$(python3 -c 'import json; print(json.load(open("m.json"))["serial"])')
+              live=$(python3 -I -c 'import json; print(json.load(open("m.json"))["serial"])')
               if [ "$live" = "$SERIAL" ]; then
                 echo "OK: the live manifest is serial $live and verifies against the feed key." | tee -a "$GITHUB_STEP_SUMMARY"
                 # Each release file the verified manifest names must be live with its sha256 (no repository code).
