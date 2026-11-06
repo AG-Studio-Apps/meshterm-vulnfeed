@@ -121,11 +121,51 @@ class IngestAndResolve(unittest.TestCase):
         body = osvfeed.release_body(ALMA, rows)
         self.assertEqual((body["format"], body["keyedBy"]), ("rpm", "binary"))
         self.assertEqual(body["ids"], ["CVE-2026-1001", "CVE-2026-1002", "CVE-2026-1004"])
-        self.assertEqual(body["fixes"], [["0", "1:1.48.10-5.el9_8", 4, [2], []],
-                                         ["0", "1:3.5.8-2.el9_8", 3, [0, 1], []]], "sorted by fixed EVR")
+        self.assertEqual(body["fixes"], [["0", "1:1.48.10-5.el9_8", 4, [2], [], "2026-10-01"],
+                                         ["0", "1:3.5.8-2.el9_8", 3, [0, 1], [], "2026-10-01"]], "sorted by fixed EVR")
         self.assertEqual(body["pkgs"], {"NetworkManager": [0], "openssl": [1], "openssl-libs": [1]})
         osvfeed.check_release_body(json.loads(json.dumps(body)), "alma-9",
                                    {"format": "rpm", "file": "x", "rows": 3})
+
+    def test_fix_date_is_the_earliest_of_its_binaries(self):
+        # S7c: one fix shared by two binaries; openssl-libs is also named by a LATER re-issue (2026-10-09) and
+        # openssl by an earlier advisory (2026-09-20): every row keeps its own earliest date, and the shared fix
+        # takes the earliest of them. A fix no record dates carries null.
+        rows, _, _, _, _, _ = self.run_release(ALMA, [
+            alsa("ALSA-2026:1101", "Important: openssl security update", [
+                affected("AlmaLinux:9", "openssl", fx("1:3.5.8-2.el9_8")),
+                affected("AlmaLinux:9", "openssl-libs", fx("1:3.5.8-2.el9_8"))], ["CVE-2026-1101"],
+                published="2026-10-01T00:00:00Z"),
+            alsa("ALSA-2026:1102", "Important: openssl security update", [
+                affected("AlmaLinux:9", "openssl-libs", fx("1:3.5.8-2.el9_8"))], ["CVE-2026-1101"],
+                published="2026-10-09T00:00:00Z"),
+            alsa("ALSA-2026:1103", "Important: openssl security update", [
+                affected("AlmaLinux:9", "openssl", fx("1:3.5.8-2.el9_8"))], ["CVE-2026-1101"],
+                published="2026-09-20T00:00:00Z"),
+            alsa("ALSA-2026:1104", "Critical: zlib security update", [
+                affected("AlmaLinux:9", "zlib", fx("1.2.11-41.el9_8"))], ["CVE-2026-1104"], published=None),
+        ])
+        self.assertEqual({r["source"]: r["date"] for r in rows},
+                         {"openssl": "2026-09-20", "openssl-libs": "2026-10-01", "zlib": None})
+        body = osvfeed.release_body(ALMA, rows)
+        self.assertEqual(body["fixes"], [["0", "1.2.11-41.el9_8", 4, [1], [], None],
+                                         ["0", "1:3.5.8-2.el9_8", 3, [0], [], "2026-09-20"]])
+        self.assertEqual(body["pkgs"], {"openssl": [1], "openssl-libs": [1], "zlib": [0]})
+        entry = {"format": "rpm", "file": "x", "rows": 3}
+        osvfeed.check_release_body(json.loads(json.dumps(body)), "alma-9", entry)
+        old = json.loads(json.dumps(body))
+        for fix in old["fixes"]:
+            fix.pop()                                    # a pre-S7c file: 5-field fixes
+        osvfeed.check_release_body(old, "alma-9", entry)
+        for value, why in (("2026-09-31", "bad fix date"), ("2026-9-20", "bad fix date"), (20260920, "bad fix date")):
+            bad = json.loads(json.dumps(body))
+            bad["fixes"][1][5] = value
+            with self.subTest(value=value), self.assertRaisesRegex(FeedError, why):
+                osvfeed.check_release_body(bad, "alma-9", entry)
+        bad = json.loads(json.dumps(body))
+        bad["fixes"][1].append(None)
+        with self.assertRaisesRegex(FeedError, "not 5 or 6 fields"):
+            osvfeed.check_release_body(bad, "alma-9", entry)
 
     def test_rhel_cvss_merged_repositories_and_kernel(self):
         rows, counters, decisions, stats, _, _ = self.run_release(RHEL, [
@@ -553,7 +593,7 @@ class EndToEnd(unittest.TestCase):
         with open(os.path.join(site, releases["alma-9"]["file"]), "rb") as handle:
             body = json.loads(handle.read())
         self.assertEqual(body, {"release": "alma-9", "format": "rpm", "keyedBy": "binary", "ids": ["CVE-2026-1001"],
-                                "fixes": [["0", "1:3.5.8-2.el9_8", 3, [0], []]], "pkgs": {"openssl-libs": [0]},
+                                "fixes": [["0", "1:3.5.8-2.el9_8", 3, [0], [], "2026-10-01"]], "pkgs": {"openssl-libs": [0]},
                                 "kernel": {"kernel-core": [["0", "5.14.0-611.5.1.el9_8", 3, 1, "2026-10-01"]]}})
         self.assertEqual(sources["osv"], {"AlmaLinux": "2026-01-11T00:00:00Z", "Red Hat": "2026-01-11T00:00:00Z"})
         build.check_sources(sources, releases)

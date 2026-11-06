@@ -157,8 +157,9 @@ class IngestAndResolve(unittest.TestCase):
         self.assertEqual(shapes, [])
         body = osvfeed.release_body(ALP, rows)
         self.assertEqual(body["pkgs"], {
-            "openssl": [["0", "3.3.2-r0", 4, ["CVE-2024-1001", "CVE-2024-1003"]], ["3.3.0", "3.3.2-r1", 4, ["CVE-2024-1002"]]],
-            "wpa_supplicant": [["0", "2.10-r0", 3, ["CVE-2024-1004"]]]})
+            "openssl": [["0", "3.3.2-r0", 4, ["CVE-2024-1001", "CVE-2024-1003"], None],
+                        ["3.3.0", "3.3.2-r1", 4, ["CVE-2024-1002"], None]],
+            "wpa_supplicant": [["0", "2.10-r0", 3, ["CVE-2024-1004"], None]]})
         self.assertEqual((body["format"], body["keyedBy"]), ("apk", "origin"))
         self.assertEqual(decisions, {"cvss": 4})
 
@@ -205,7 +206,7 @@ class IngestAndResolve(unittest.TestCase):
         self.assertEqual(stats[f"alpine-3.22: {osvfeed.NOT_AFFECTED}"], 1)
         self.assertEqual(stats["alpine-3.22: unfixed (dropped)"], 0)        # not-affected is not "unfixed"
         body = osvfeed.release_body(ALP, rows)
-        self.assertEqual(body["pkgs"]["imagemagick"], [["7.0.0.0", "7.1.2.15-r0", 3, ["CVE-2019-17540"]]])
+        self.assertEqual(body["pkgs"]["imagemagick"], [["7.0.0.0", "7.1.2.15-r0", 3, ["CVE-2019-17540"], None]])
         osvfeed.check_release_body(json.loads(json.dumps(body)), "alpine-3.22",
                                    {"format": "apk", "file": "x", "rows": 3})
 
@@ -220,7 +221,7 @@ class IngestAndResolve(unittest.TestCase):
         ])
         body = osvfeed.release_body(ALP, rows)
         self.assertEqual(body["kernel"], {"linux-lts": [["0", "6.6.58-r0", 4, 2, None]]})
-        self.assertEqual(body["pkgs"], {"linux-pam": [["0", "1.6.0-r0", 3, ["CVE-2024-10022"]]]})
+        self.assertEqual(body["pkgs"], {"linux-pam": [["0", "1.6.0-r0", 3, ["CVE-2024-10022"], None]]})
         self.assertEqual(counters["kernel rows"], 1)
 
     def test_kernel_names(self):
@@ -287,6 +288,14 @@ class ReleaseBody(unittest.TestCase):
         bad(lambda b: b["pkgs"].update({"linux-lts": b["kernel"].pop("linux-lts")}), "bad pkgs source")
         bad(lambda b: b["kernel"].update({"linux-pam": b["kernel"].pop("linux-lts")}), "bad kernel source")
         bad(lambda b: b["pkgs"]["openssl"][0].__setitem__(2, 2), "not High or Critical")
+        # S7c: an apk package row's 5th element is null only (no fix date in OSV Alpine), as its kernel rows.
+        bad(lambda b: b["pkgs"]["openssl"][0].append("2024-10-01"), "bad fix date")
+        bad(lambda b: b["pkgs"]["openssl"][0].extend([None, None]), "not 4 or 5 fields")
+
+    def test_null_fix_date_accepted(self):
+        body = self.body()
+        body["pkgs"]["openssl"][0].append(None)          # one S7c row beside a pre-S7c one
+        self.check(body)
 
     def test_dpkg_bodies_unchanged(self):
         body = {"release": "debian-12", "format": "dpkg", "keyedBy": "source",
@@ -468,7 +477,7 @@ class EndToEnd(unittest.TestCase):
         with open(os.path.join(site, entry["file"]), "rb") as handle:
             body = json.loads(handle.read())
         self.assertEqual(body, {"release": "alpine-3.22", "format": "apk", "keyedBy": "origin",
-                                "pkgs": {"openssl": [["0", "3.3.2-r0", 3, ["CVE-2024-1001"]]]},
+                                "pkgs": {"openssl": [["0", "3.3.2-r0", 3, ["CVE-2024-1001"], None]]},
                                 "kernel": {"linux-lts": [["0", "6.6.58-r0", 4, 1, None]]}})
         self.assertEqual(sources, {"osv": {"Alpine": "2026-11-05T09:30:02Z"}, "archive": {}, "baseline": {}})
 

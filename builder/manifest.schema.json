@@ -25,7 +25,7 @@
     },
     "releases": {
       "type": "object",
-      "description": "Release key -> its content-addressed file (body: {release, format, keyedBy, pkgs, kernel}, plan 4.1). Keys are the builder/osvfeed.py RELEASES allowlist.",
+      "description": "Release key -> its content-addressed file (body: {release, format, keyedBy, pkgs, kernel}, plan 4.1; a package row is [introduced, fixed, severity, ids, publishedDate|null] and an rpm fix [introduced, fixed, severity, [id index], [stream], publishedDate|null], the trailing date optional (S7c), README 'Release files'). Keys are the builder/osvfeed.py RELEASES allowlist.",
       "propertyNames": {"enum": ["ubuntu-20.04", "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04", "ubuntu-26.10",
                                  "ubuntu-20.04-esm", "ubuntu-22.04-esm", "ubuntu-24.04-esm", "ubuntu-26.04-esm",
                                  "debian-11", "debian-12", "debian-13",

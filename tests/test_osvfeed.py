@@ -274,6 +274,39 @@ class IngestAndResolve(unittest.TestCase):
         self.assertEqual(row["severity"], 4)
         self.assertEqual(row["date"], "2026-03-03")
 
+    def test_fix_date_is_the_earliest_advisory_else_the_earliest_record(self):
+        # S7c: two DSAs name one fix (a re-issue, then the original): the row, and the file's 5th element, take
+        # the EARLIEST advisory, never the CVE record's older date; with no advisory, the earliest record.
+        recs = [
+            record("DEBIAN-CVE-2026-0040", [affected("Debian:12", "xx", fixed("1.0-1+deb12u1"))],
+                   upstream=["CVE-2026-0040"], severity=[{"type": "CVSS_V3", "score": CVSS_HIGH}],
+                   published="2025-12-01T00:00:00Z"),
+            record("DSA-6002-2", [affected("Debian:12", "xx", fixed("1.0-1+deb12u1"))], upstream=["CVE-2026-0040"],
+                   published="2026-03-09T10:00:00Z"),
+            record("DSA-6002-1", [affected("Debian:12", "xx", fixed("1.0-1+deb12u1"))], upstream=["CVE-2026-0040"],
+                   published="2026-03-02T10:00:00Z"),
+            record("DEBIAN-CVE-2026-0041", [affected("Debian:12", "yy", fixed("2.0-1+deb12u1"))],
+                   upstream=["CVE-2026-0041"], severity=[{"type": "CVSS_V3", "score": CVSS_HIGH}],
+                   published="2026-02-20T00:00:00Z"),
+            record("DEBIAN-CVE-2026-0042", [affected("Debian:12", "yy", fixed("2.0-1+deb12u1"))],
+                   upstream=["CVE-2026-0042"], severity=[{"type": "CVSS_V3", "score": CVSS_HIGH}],
+                   published="2026-02-10T00:00:00Z"),
+            record("DEBIAN-CVE-2026-0043", [affected("Debian:12", "zz", fixed("3.0-1+deb12u1"))],
+                   upstream=["CVE-2026-0043"], severity=[{"type": "CVSS_V3", "score": CVSS_HIGH}], published=None),
+        ]
+        archive = {"xx": "1.0-1+deb12u1", "yy": "2.0-1+deb12u1", "zz": "3.0-1+deb12u1"}
+        rows, _, _, _, _, _ = self.run_release(DEB, recs, archive, {})
+        self.assertEqual(rows[("xx", "1.0-1+deb12u1")]["date"], "2026-03-02")
+        self.assertEqual(rows[("yy", "2.0-1+deb12u1")]["date"], "2026-02-10")
+        self.assertIsNone(rows[("zz", "3.0-1+deb12u1")]["date"])
+        body = osvfeed.release_body(DEB, list(rows.values()))
+        self.assertEqual(body["pkgs"], {
+            "xx": [["0", "1.0-1+deb12u1", 3, ["CVE-2026-0040"], "2026-03-02"]],
+            "yy": [["0", "2.0-1+deb12u1", 3, ["CVE-2026-0041", "CVE-2026-0042"], "2026-02-10"]],
+            "zz": [["0", "3.0-1+deb12u1", 3, ["CVE-2026-0043"], None]]})
+        osvfeed.check_release_body(json.loads(osvfeed.body_bytes(body)), "debian-12",
+                                   {"format": "dpkg", "file": "x", "rows": 3})
+
     def test_withdrawn_records_skipped(self):
         recs = [record("UBUNTU-CVE-2026-0040", [affected("Ubuntu:24.04:LTS", "xx", fixed("1.0-1"))],
                        upstream=["CVE-2026-0040"], severity=[{"type": "Ubuntu", "score": "high"}],
@@ -302,7 +335,7 @@ class KernelFold(unittest.TestCase):
         body = osvfeed.release_body(UBU, rows)
         self.assertEqual(body["kernel"], {"linux-aws-6.8": [["0", "6.8.0-1038.40~22.04.1", 4, 1, "2026-10-01"],
                                                                ["0", "6.8.0-1040.42~22.04.1", 3, 2, "2026-10-30"]]})
-        self.assertEqual(body["pkgs"], {"linuxptp": [["0", "4.0-1ubuntu0.1", 3, ["CVE-2026-4"]]]})
+        self.assertEqual(body["pkgs"], {"linuxptp": [["0", "4.0-1ubuntu0.1", 3, ["CVE-2026-4"], "2026-09-01"]]})
         self.assertEqual(osvfeed.row_count(body), 3)
 
     def test_kernel_names(self):
@@ -539,6 +572,44 @@ class ReleaseBody(unittest.TestCase):
         with self.assertRaisesRegex(FeedError, "keys must be"):
             osvfeed.check_release_body(bad, "debian-12", entry)
 
+    def test_fix_date_element(self):
+        # S7c: a package row is 4 fields (a pre-S7c file) or 5, the 5th a real YYYY-MM-DD day or null.
+        rows = [{"source": "apt", "introduced": "0", "fixed": "2.6.2", "severity": 3, "ids": ["CVE-2026-109518"],
+                 "kernel": False, "date": "2026-11-04"}]
+        body = json.loads(osvfeed.body_bytes(osvfeed.release_body(DEB, rows)))
+        self.assertEqual(body["pkgs"]["apt"], [["0", "2.6.2", 3, ["CVE-2026-109518"], "2026-11-04"]])
+        entry = {"format": "dpkg", "file": "r/debian-12-x.json", "rows": 1}
+        for good in ("2026-11-04", None, "drop"):
+            ok = json.loads(json.dumps(body))
+            if good == "drop":
+                ok["pkgs"]["apt"][0].pop()
+            else:
+                ok["pkgs"]["apt"][0][4] = good
+            osvfeed.check_release_body(ok, "debian-12", entry)
+        for value in ("2026-13-01", "2026-02-30", "2026-11-4", "2026-11-04\n", "2026-11-04T00:00:00Z",
+                      "\u0662\u0660\u0662\u0666-11-04", "", 20261104, True, ["2026-11-04"]):
+            with self.subTest(value=value):
+                bad = json.loads(json.dumps(body))
+                bad["pkgs"]["apt"][0][4] = value
+                with self.assertRaisesRegex(FeedError, "bad fix date"):
+                    osvfeed.check_release_body(bad, "debian-12", entry)
+        bad = json.loads(json.dumps(body))
+        bad["pkgs"]["apt"][0].append("2026-11-04")
+        with self.assertRaisesRegex(FeedError, "is not 4 or 5 fields"):
+            osvfeed.check_release_body(bad, "debian-12", entry)
+        bad = json.loads(json.dumps(body))
+        bad["pkgs"]["apt"][0][4:] = []
+        bad["pkgs"]["apt"][0].pop()
+        with self.assertRaisesRegex(FeedError, "is not 4 or 5 fields"):
+            osvfeed.check_release_body(bad, "debian-12", entry)
+
+    def test_first_four_elements_unchanged(self):
+        # The shipped app reads exactly the first 4: S7c only appends.
+        rows = [{"source": "apt", "introduced": "0", "fixed": "2.6.2", "severity": 4,
+                 "ids": ["CVE-2026-1", "CVE-2026-2"], "kernel": False, "date": "2026-11-04"}]
+        row = osvfeed.release_body(DEB, rows)["pkgs"]["apt"][0]
+        self.assertEqual(row, ["0", "2.6.2", 4, ["CVE-2026-1", "CVE-2026-2"], "2026-11-04"])
+
 
 class EndToEnd(unittest.TestCase):
     """build_releases() over file:// mirrors: fake OSV zip + modified_id.csv, fake signed InRelease + Sources.xz."""
@@ -632,7 +703,7 @@ class EndToEnd(unittest.TestCase):
             data = handle.read()
         self.assertEqual(netfetch.hashlib.sha256(data).hexdigest(), entry["sha256"])
         body = json.loads(data)
-        self.assertEqual(body["pkgs"], {"openssl": [["0", "3.0.13-0ubuntu3.6", 3, ["CVE-2026-0050"]]]})
+        self.assertEqual(body["pkgs"], {"openssl": [["0", "3.0.13-0ubuntu3.6", 3, ["CVE-2026-0050"], "2026-02-02"]]})
         self.assertEqual(body["kernel"], {"linux-gcp": [["0", "6.8.0-1020.21", 3, 1, "2026-01-10"]]})
         self.assertEqual(sources["osv"], {"Ubuntu": "2026-02-03T04:05:06Z"})
         self.assertEqual(sources["baseline"], {"ubuntu-24.04": "2024-04-25"})

@@ -29,7 +29,9 @@ Then, per release, with the archive Sources of every pocket and component loaded
    Debian: the highest CVSS 3.x/4.0 score, else High when a DSA/DLA that names this id ships this fix, else
    Medium.
    Only ids that are High or Critical stay; a row with none left is dropped.
-8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`.
+8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`. Other rows
+   are `[introduced, fixed, severity, ids, publishedDate]` (S7c): the same date (the earliest advisory naming the
+   fix, else the earliest record), null when none; the app reads the first 4 (5th optional, for "Fix published").
 
 Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
 1. A range with a not-affected marker (fixed "0" / "0-r0") is dropped whole and counted. Each `introduced` is
@@ -48,7 +50,7 @@ Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differ
    from the branch's aports secfixes (so a fix is in that branch's repository), and there is no
    release-day archive to cut against. APKINDEX is RSA-signed, which the stdlib cannot verify.
 7. Severity: the highest CVSS 3.x/4.0 score, else Medium.
-8. Kernel origins (APK_KERNELS) fold with a null publishedDate: OSV Alpine has no fix date (a record's
+8. Kernel origins (APK_KERNELS) fold with a null publishedDate, and every package row carries a null one too: OSV Alpine has no fix date (a record's
    `published` is the CVE's NVD date, older than the fix), and the app never counts a pending kernel restart
    from a null date.
 
@@ -1103,20 +1105,32 @@ def release_body(release, rows):
     """The shipped JSON object (plan 4.1). An rpm file (S5) is COMPACT: keyed by binary rpm name, the fixes are
     shared (one advisory fixes every binary of its source package at one EVR), so the file holds a sorted CVE id
     table `ids`, a fix table `fixes` of `[introduced, fixed, severity, [id index ...], [stream ...]]` sorted by fixed
-    EVR, and per binary the sorted indexes of its fixes (`pkgs`). A binary's rows are its fixes; the row count is the
+    EVR (S7c: plus an optional 6th element, the fix's publish date or null), and per binary the sorted indexes of its
+    fixes (`pkgs`). A binary's rows are its fixes; the row count is the
     number of (binary, fix) pairs plus the kernel rows, as for the other formats."""
     apk = release.format == "apk"
     rpm = release.format == "rpm"
     pkgs, kernel = collections.defaultdict(list), collections.defaultdict(list)
+    fix_date = {}
     for row in rows:
         if row["kernel"]:
             kernel[row["source"]].append([row["introduced"], row["fixed"], row["severity"], len(row["ids"]),
                                           None if apk else row["date"]])
         elif rpm:
-            pkgs[row["source"]].append((row["introduced"], row["fixed"], row["severity"], tuple(row["ids"]),
-                                        tuple(row.get("streams") or [])))
+            fix = (row["introduced"], row["fixed"], row["severity"], tuple(row["ids"]), tuple(row.get("streams") or []))
+            pkgs[row["source"]].append(fix)
+            # S7c: one fix is shared by every binary naming it, so it takes the EARLIEST date of those binaries'
+            # rows (each already the earliest `published` of its records): the day the fix was first published, as
+            # the kernel rows and the dpkg rows say. A later advisory re-listing the same EVR is not a newer fix.
+            if row["date"] and (fix_date.get(fix) is None or row["date"] < fix_date[fix]):
+                fix_date[fix] = row["date"]
         else:
-            pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"]])
+            # S7c: the fix's publish date as an OPTIONAL 5th element, by the kernel rows' convention: the row's
+            # `date` (dpkg: the earliest advisory naming this fix, else the earliest record; the candidate already
+            # folded every record naming it to its EARLIEST date, the day the fix was first published), null when
+            # there is none, and always null in an apk file (OSV Alpine has no fix date). The app reads the first 4.
+            pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"],
+                                        None if apk else row["date"]])
     fmt = release.format
     body = {"release": release.key, "format": fmt, "keyedBy": _BODY_FORMATS[fmt][0],
             "kernel": {k: sort_rows(v, fmt) for k, v in sorted(kernel.items())}}
@@ -1131,7 +1145,8 @@ def release_body(release, rows):
     id_index = {cve: n for n, cve in enumerate(ids)}
     fix_index = {tuple(f): n for n, f in enumerate(fixes)}
     body["ids"] = ids
-    body["fixes"] = [[f[0], f[1], f[2], [id_index[i] for i in f[3]], list(f[4])] for f in fixes]
+    body["fixes"] = [[f[0], f[1], f[2], [id_index[i] for i in f[3]], list(f[4]), fix_date.get(tuple(f))]
+                     for f in fixes]
     body["pkgs"] = {k: sorted({fix_index[f] for f in v}) for k, v in sorted(pkgs.items())}
     return body
 
@@ -1199,11 +1214,25 @@ def sort_rows(rows, fmt="dpkg"):
 
 _ID = re.compile(r"^(CVE-\d{4}-\d{4,}|(USN|DSA|DLA|DTSA|LSN)-\d+(-\d+)?|(UBUNTU|DEBIAN)-CVE-\d{4}-\d{4,})$")
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DAY_STRICT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")   # ASCII digits, no trailing newline (fullmatch)
 # Per format: (keyedBy, id pattern). apk ids are upstream CVEs only.
 _BODY_FORMATS = {"dpkg": ("source", _ID), "apk": ("origin", _CVE), "rpm": ("binary", _CVE)}
 # S5: a module stream in an rpm row (`php:8.1`, `virt-devel:rhel`).
 _STREAM_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*:[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 FORMAT_OF = {r.key: r.format for r in RELEASES}
+
+
+def fix_date_ok(value, fmt):
+    """A row's publish-date element: null, or (dpkg / rpm only: apk has no fix date) a real YYYY-MM-DD day."""
+    if value is None:
+        return True
+    if fmt not in ("dpkg", "rpm") or not isinstance(value, str) or not _DAY_STRICT.fullmatch(value):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def check_release_body(body, key, entry):
@@ -1221,7 +1250,9 @@ def check_release_body(body, key, entry):
     count = 0
     if fmt == "rpm":
         count += _check_rpm_tables(body, fail)
-    for section, width in ((("kernel", 5),) if fmt == "rpm" else (("pkgs", 4), ("kernel", 5))):
+    # S7c: a pkgs row may carry a 5th element, the fix's publish date (YYYY-MM-DD, or null; always null in apk);
+    # a 4-element row (a file built before S7c, carried forward) still passes.
+    for section, widths in ((("kernel", (5,)),) if fmt == "rpm" else (("pkgs", (4, 5)), ("kernel", (5,)))):
         if not isinstance(body[section], dict):
             fail(f"{section} is not an object")
         for source, rows in body[section].items():
@@ -1231,8 +1262,8 @@ def check_release_body(body, key, entry):
                 fail(f"{source}: no rows")
             for row in rows:
                 count += 1
-                if not isinstance(row, list) or len(row) != width:
-                    fail(f"{source}: row {row!r} is not {width} fields")
+                if not isinstance(row, list) or len(row) not in widths:
+                    fail(f"{source}: row {row!r} is not {' or '.join(map(str, widths))} fields")
                 introduced, fixed, sev = row[0], row[1], row[2]
                 intro_ok = introduced == "0" or (version_ok(fmt, introduced) if fmt in ("apk", "rpm")
                                                  else _cmp_ok(introduced) is not None)
@@ -1245,10 +1276,11 @@ def check_release_body(body, key, entry):
                     if not isinstance(ids, list) or not ids or ids != sorted(set(ids)) \
                             or not all(isinstance(i, str) and id_re.match(i) for i in ids):
                         fail(f"{source}: bad ids {ids!r}")
+                    if len(row) == 5 and not fix_date_ok(row[4], fmt):
+                        fail(f"{source}: bad fix date in {row!r}")
                 else:
                     # apk kernel rows always carry a null date (no fix date in OSV Alpine).
-                    if type(row[3]) is not int or row[3] < 1 or not (row[4] is None or (
-                            fmt in ("dpkg", "rpm") and isinstance(row[4], str) and _DAY.match(row[4]))):
+                    if type(row[3]) is not int or row[3] < 1 or not fix_date_ok(row[4], fmt):
                         fail(f"{source}: bad kernel row {row!r}")
     if count != entry["rows"]:
         fail(f"{count} rows, the manifest says {entry['rows']}")
@@ -1266,9 +1298,12 @@ def _check_rpm_tables(body, fail):
         fail("fixes is not a list or pkgs is not an object")
     used_ids = set()
     for fix in fixes:
-        if not isinstance(fix, list) or len(fix) != 5:
-            fail(f"fix {fix!r} is not 5 fields")
-        introduced, fixed, sev, refs, streams = fix
+        # S7c: an optional 6th element, the fix's publish date (a pre-S7c file has 5).
+        if not isinstance(fix, list) or len(fix) not in (5, 6):
+            fail(f"fix {fix!r} is not 5 or 6 fields")
+        introduced, fixed, sev, refs, streams = fix[:5]
+        if len(fix) == 6 and not fix_date_ok(fix[5], "rpm"):
+            fail(f"fix {fix!r}: bad fix date")
         if not (introduced == "0" or version_ok("rpm", introduced)) or not version_ok("rpm", fixed):
             fail(f"bad version in fix {fix!r}")
         if type(sev) is not int or sev not in (cvss.HIGH, cvss.CRITICAL):
@@ -1482,7 +1517,7 @@ def apk_hits(body, inventory):
         installed = inventory.get(origin)
         if installed is None:
             continue
-        for introduced, fixed, _, _ in rows:
+        for introduced, fixed in (row[:2] for row in rows):
             if introduced != "0" and apkver.compare(installed, introduced) < 0:
                 continue
             if apkver.compare(installed, fixed) < 0:

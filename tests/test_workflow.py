@@ -320,6 +320,83 @@ class SignJobFormats(unittest.TestCase):
         self.assertIn("says format 'dpkg', the manifest 'apk'", result.stdout)
 
 
+class SignJobFixDates(unittest.TestCase):
+    """S7c: a dpkg / apk package row may carry a 5th element, the fix's publish date: the sign job, inline, takes a
+    real YYYY-MM-DD day or null (dpkg), null only (apk), and refuses anything else in that slot."""
+
+    def build_site(self, options):
+        self.repo = helpers.scratch_repo()
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.out = os.path.join(self.repo, "out")
+        self.manifest, _ = build.build(self.repo, self.out, helpers.COMMIT, NOW, log=build.Log(echo=False),
+                                       options=options)
+        self.script = os.path.join(self.repo, "signcheck.py")
+        with open(self.script, "w") as handle:
+            handle.write(sign_check_script())
+
+    def check_with(self, options, key, change):
+        import hashlib
+        self.build_site(options)
+        path = os.path.join(self.out, "v1", "manifest.json")
+        with open(path) as handle:
+            manifest = json.load(handle)
+        entry = manifest["releases"][key]
+        body_path = os.path.join(self.out, "v1", entry["file"])
+        with open(body_path, "rb") as handle:
+            body = json.loads(handle.read())
+        os.remove(body_path)
+        change(body)
+        data = osvfeed.body_bytes(body)
+        sha = hashlib.sha256(data).hexdigest()
+        name = f"r/{key}-{sha[:16]}.json"
+        with open(os.path.join(self.out, "v1", name), "wb") as handle:
+            handle.write(data)
+        entry.update(file=name, sha256=sha, bytes=len(data))
+        with open(path, "w") as handle:
+            json.dump(manifest, handle)
+        env = dict(os.environ, SITE=self.out, SERIAL=str(self.manifest["serial"]), DATE=NOW[:10])
+        return subprocess.run([sys.executable, "-I", self.script], cwd=self.repo, env=env, capture_output=True,
+                              text=True)
+
+    def row(self, body):
+        return next(iter(body["pkgs"].values()))[0]
+
+    def test_dpkg(self):
+        self.build_site(helpers.fake_releases())
+        with open(os.path.join(self.out, "v1", self.manifest["releases"]["debian-12"]["file"]), "rb") as handle:
+            self.assertEqual(json.loads(handle.read())["pkgs"]["apt"][0][4], "2026-11-04", "the builder dates it")
+        why = "has a bad package row (not 4 fields, or a bad fix date)"
+        for value in ("2026-13-01", "2026-02-30", "2026-11-4", "2026-11-04T00:00:00Z", "2026-11-04\n", "",
+                      20261104, True, ["2026-11-04"], {"d": "2026-11-04"}):
+            with self.subTest(value=value):
+                result = self.check_with(helpers.fake_releases(), "debian-12",
+                                         lambda b: self.row(b).__setitem__(4, value))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(why, result.stdout)
+        for change in (lambda b: self.row(b).append(None), lambda b: (self.row(b).pop(), self.row(b).pop()),
+                       lambda b: b["pkgs"].update(apt="x"), lambda b: b["pkgs"].update(apt=[["0", "1", 3, []][0]])):
+            with self.subTest(change=change):
+                result = self.check_with(helpers.fake_releases(), "debian-12", change)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(why, result.stdout)
+        for change in (lambda b: None, lambda b: self.row(b).__setitem__(4, None),
+                       lambda b: self.row(b).__setitem__(4, "2024-02-29"), lambda b: self.row(b).pop()):
+            with self.subTest(change=change):
+                result = self.check_with(helpers.fake_releases(), "debian-12", change)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_apk_null_only(self):
+        self.build_site(alpine_releases())
+        with open(os.path.join(self.out, "v1", self.manifest["releases"]["alpine-3.22"]["file"]), "rb") as handle:
+            self.assertEqual(json.loads(handle.read())["pkgs"]["openssl"][0][4:], [None])
+        result = self.check_with(alpine_releases(), "alpine-3.22", lambda b: self.row(b).__setitem__(4, "2026-11-04"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has a bad package row (not 4 fields, or a bad fix date)", result.stdout)
+        for change in (lambda b: None, lambda b: self.row(b).pop()):
+            result = self.check_with(alpine_releases(), "alpine-3.22", change)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 def rpm_releases():
     """ReleaseOptions whose S2 step writes one small, valid (compact) alma-9 file and nothing else."""
     from feedlib import content_name, sha256_hex
@@ -439,7 +516,14 @@ class SignJobRpm(SignJobFormats):
             (lambda b: b["pkgs"].update({"openssl-libs": ["0"]}), "has a bad rpm pkgs fix indexes"),
             (lambda b: b["pkgs"].update({"openssl-libs": [0, 0]}), "has a bad rpm pkgs fix indexes"),
             (lambda b: b["fixes"][0][3].append(5), "has a bad rpm fixes table"),
-            (lambda b: b["fixes"][0].pop(), "has a bad rpm fixes table"),
+            (lambda b: (b["fixes"][0].pop(), b["fixes"][0].pop()), "has a bad rpm fixes table"),
+            (lambda b: b["fixes"][0].append("x"), "has a bad rpm fixes table"),
+            # S7c: the optional 6th element, the fix's publish date, is a real YYYY-MM-DD day or null.
+            (lambda b: b["fixes"][0].__setitem__(5, "2026-13-01"), "has a bad rpm fix date"),
+            (lambda b: b["fixes"][0].__setitem__(5, "2026-10-1"), "has a bad rpm fix date"),
+            (lambda b: b["fixes"][0].__setitem__(5, "2026-10-01T00:00:00Z"), "has a bad rpm fix date"),
+            (lambda b: b["fixes"][0].__setitem__(5, 20261001), "has a bad rpm fix date"),
+            (lambda b: b["fixes"][0].__setitem__(5, ""), "has a bad rpm fix date"),
             (lambda b: b["fixes"].append(["0", "1:9-1.el9", 3, [0], []]),
              "has a bad rpm table (an id or a fix nothing refers to)"),
             (lambda b: b["ids"].append("CVE-2026-19999"), "has a bad rpm table (an id or a fix nothing refers to)"),
@@ -473,7 +557,8 @@ class SignJobRpm(SignJobFormats):
                 self.assertIn(why, result.stdout)
         for change in (lambda b: None, lambda b: b["fixes"][0].__setitem__(2, 4),
                        lambda b: b["fixes"][0].__setitem__(4, ["php:" + "8" * 60]),
-                       lambda b: b["kernel"].update({"kernel-rt-core": b["kernel"].pop("kernel-core")})):
+                       lambda b: b["kernel"].update({"kernel-rt-core": b["kernel"].pop("kernel-core")}),
+                       lambda b: b["fixes"][0].pop(), lambda b: b["fixes"][0].__setitem__(5, None)):
             self.setUp()
             self.rewrite_body(change)
             result = self.run_check()

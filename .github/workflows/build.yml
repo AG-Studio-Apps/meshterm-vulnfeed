@@ -375,8 +375,10 @@ jobs:
                           or not all(isinstance(i, str) and re.fullmatch(r"CVE-[0-9]{4}-[0-9]{4,}", i) for i in ids_t):
                       bad = "ids table"
                   elif not isinstance(fixes_t, list) \
-                          or not all(isinstance(f, list) and len(f) == 5 and refs_ok(f[3], len(ids_t)) for f in fixes_t):
+                          or not all(isinstance(f, list) and len(f) in (5, 6) and refs_ok(f[3], len(ids_t)) for f in fixes_t):
                       bad = "fixes table"
+                  elif not all(len(f) == 5 or f[5] is None or day_ok(f[5]) for f in fixes_t):
+                      bad = "fix date"
                   elif not all(f[2] in (3, 4) and type(f[2]) is int and isinstance(f[4], list)
                                and all(isinstance(x, str) and len(x) <= 64 for x in f[4]) for f in fixes_t):
                       bad = "fix severity or streams"
@@ -391,6 +393,16 @@ jobs:
                       bad = "table (an id or a fix nothing refers to)"
                   if bad:
                       problems.append(f"release {key}: {name} has a bad rpm {bad}"); continue
+              else:
+                  # S7c: a dpkg / apk package row is [introduced, fixed, severity, ids] plus an optional 5th element,
+                  # the fix's publish date: a real YYYY-MM-DD day or null (dpkg), only null (apk: no fix date in OSV
+                  # Alpine). The app reads the first 4; anything else in the 5th slot is refused here.
+                  pk = body.get("pkgs")
+                  rows_ok = isinstance(pk, dict) and all(isinstance(v, list) and all(
+                      isinstance(r, list) and (len(r) == 4 or (len(r) == 5 and (r[4] is None or (
+                          fmt_of(key) == "dpkg" and day_ok(r[4]))))) for r in v) for v in pk.values())
+                  if not rows_ok:
+                      problems.append(f"release {key}: {name} has a bad package row (not 4 fields, or a bad fix date)"); continue
               try:
                   count = sum(len(v) for part in ("pkgs", "kernel") for v in body[part].values())
               except (AttributeError, TypeError):

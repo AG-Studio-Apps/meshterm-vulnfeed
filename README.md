@@ -69,12 +69,17 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
 
 ```json
 {"release":"ubuntu-24.04","format":"dpkg","keyedBy":"source",
- "pkgs":{"apt":[["0","2.8.4ubuntu0.1",3,["CVE-2026-109518"]]]},
+ "pkgs":{"apt":[["0","2.8.4ubuntu0.1",3,["CVE-2026-109518"],"2026-11-03"]]},
  "kernel":{"linux-aws-6.8":[["0","6.8.0-1040.42~22.04.1",3,57,"2026-10-30"]]}}
 ```
 
-A package row is `[introduced, fixed, severity, ids]` (severity 3 High, 4 Critical; ids are the High/Critical
-CVEs fixed there); a kernel row is `[introduced, fixed, maxSeverity, count, publishedDate]`. Keyed by SOURCE
+A package row is `[introduced, fixed, severity, ids, publishedDate]` (severity 3 High, 4 Critical; ids are the
+High/Critical CVEs fixed there); a kernel row is `[introduced, fixed, maxSeverity, count, publishedDate]`.
+`publishedDate` (S7c on package rows) is the day the fix was published, `YYYY-MM-DD` or null when no record dates
+it: the EARLIEST `published` of the advisories (USN/DSA/DLA) naming that fix, else of any record naming it (one row
+folds every record naming the same (source, introduced, fixed), and the earliest is the day the fix first shipped;
+a later advisory re-listing it is not a newer fix). The app reads a package row's first 4 elements, so the 5th is
+optional: a file built before S7c has 4-element rows and still passes every check. Keyed by SOURCE
 package: hosts match `${source:Package}` / `${source:Version}`.
 
 Releases (`RELEASES` in `builder/osvfeed.py`, and the sign job's allowlist): `ubuntu-20.04`, `-22.04`, `-24.04`,
@@ -110,7 +115,7 @@ release (below) needs its entry too.
 
 ```json
 {"release":"alpine-3.22","format":"apk","keyedBy":"origin",
- "pkgs":{"openssl":[["0","3.3.2-r0",3,["CVE-2024-0001"]],["3.3.0","3.3.2-r1",4,["CVE-2024-0002"]]]},
+ "pkgs":{"openssl":[["0","3.3.2-r0",3,["CVE-2024-0001"],null],["3.3.0","3.3.2-r1",4,["CVE-2024-0002"],null]]},
  "kernel":{"linux-lts":[["0","6.6.58-r0",4,12,null]]}}
 ```
 
@@ -160,7 +165,8 @@ Differences from the dpkg rules:
 - **Kernel**: `linux-lts`, `linux-edge`, `linux-rpi`, `linux-virt`, `linux-stable` fold to kernel rows (not
   `linux-pam`, `linux-headers`, `linux-firmware*`, `linux-tools`), with a **null** publishedDate: OSV Alpine
   has no fix date (a record's `published` is the CVE's NVD date, older than the fix), and the app never counts
-  a pending kernel restart from a null date.
+  a pending kernel restart from a null date. Package rows carry the same null 5th element (S7c, the kernel
+  rows' convention).
 - **Golden cases** (`builder/golden/*.apk.txt`): the app's Pro probe output (`grep -E "^([PVo]:|$)"
   /lib/apk/db/installed`, as uid 1000) from stock `alpine:3.20`, `alpine:3.20.0` and `alpine:latest`. They are
   matched against the shipped rows exactly as the app does (per origin the highest installed version;
@@ -174,7 +180,7 @@ Differences from the dpkg rules:
 ```json
 {"release":"alma-9","format":"rpm","keyedBy":"binary",
  "ids":["CVE-2026-0001","CVE-2026-0002","CVE-2026-0003"],
- "fixes":[["0","1:3.5.8-2.el9_8",3,[0,1],[]],["0","8.2.33-1.module_el9.8.0+303+1bef6c12",4,[2],["php:8.2"]]],
+ "fixes":[["0","1:3.5.8-2.el9_8",3,[0,1],[],"2026-10-14"],["0","8.2.33-1.module_el9.8.0+303+1bef6c12",4,[2],["php:8.2"],"2026-10-02"]],
  "pkgs":{"openssl":[0],"openssl-libs":[0],"php-cli":[1]},
  "kernel":{"kernel-core":[["0","5.14.0-611.5.1.el9_8",4,12,"2026-10-01"]]}}
 ```
@@ -198,7 +204,9 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
 
 - **Keyed by BINARY rpm name**: OSV's EL records name binaries (`openssl`, `openssl-libs`, `openssl-devel`) and no
   source rpm, so the file is COMPACT: a sorted CVE table, a fix table sorted by fixed EVR (`[introduced, fixed,
-  severity, [id index ...], [module stream ...]]`) and per binary the indexes of its fixes. The row count is the
+  severity, [id index ...], [module stream ...], publishedDate]`; the date, S7c, is the earliest `published` of the
+  advisories naming that fix for any of its binaries, or null, and the app reads only the first 5 elements) and per
+  binary the indexes of its fixes. The row count is the
   (binary, fix) pairs plus the kernel rows. The app groups its findings by each binary's SOURCERPM.
 - **Versions** are EVRs compared by `builder/rpmver.py` (rpm-6.1.0 rpmvercmp, its own vectors shared with the app).
 - **Only records naming an upstream CVE ship** (ALBA / ALEA / most RHBA name none); `-debuginfo` / `-debugsource`
@@ -263,11 +271,14 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
 - **Dates**: a row's date is the earliest `published` of the records naming it. Red Hat's `published` is often the
   day its records were CONVERTED to OSV, not the advisory's (RHSA-2003:315 says 2024-09-12), so it is good for the
   "fix older than 7 days" kernel rule and for "before the capture" on a capture-day golden, but never for a backdated
-  golden (a `capture` in the past would silently drop every old advisory converted later; review L6).
+  golden (a `capture` in the past would silently drop every old advisory converted later; review L6). The same date
+  is the fix's `publishedDate` in the file (S7c), so on rhel-* an old fix can read as "published" on its conversion
+  day.
 - **Fit to the cap**: a file over 600 KB keeps the newest N fixes per (binary, module stream), the largest N of 16,
   12, 10, 8, 6, 5, 4, 3 that fits. A host below an older fix is below every newer one, so no finding is lost; it lists
   fewer CVEs and can show a lower severity. Logged and counted. None needs it since review H1: rhel-8 was 850 KB with
-  the zip-wide CVSS (pruned to 6 per binary), and is 486 KB (21% under the cap) rated by Red Hat. Any release file
+  the zip-wide CVSS (pruned to 6 per binary), and is 486 KB (21% under the cap) rated by Red Hat; the S7c fix dates
+  add 13 bytes per fix (about 532 KB, 13% under, estimated from serial 5). Any release file
   within 5% of the cap warns in the build record (`CAP_HEADROOM_WARN`, review L1).
 - **Golden cases** (`builder/golden/*.rpm.tsv`): the app's Pro probe rpm listing from stock `almalinux:9` (9.8, the
   EL false-positive gate: `exact: []`), `almalinux:9.2` (July 2023), `rockylinux:9` (the library image, 9.3) and
