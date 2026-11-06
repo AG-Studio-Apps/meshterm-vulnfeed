@@ -30,8 +30,9 @@ Then, per release, with the archive Sources of every pocket and component loaded
    Medium.
    Only ids that are High or Critical stay; a row with none left is dropped.
 8. Kernel fold: kernel sources become `[introduced, fixed, maxSeverity, count, publishedDate]`. Other rows
-   are `[introduced, fixed, severity, ids, publishedDate]` (S7c): the same date (the earliest advisory naming the
-   fix, else the earliest record), null when none; the app reads the first 4 (5th optional, for "Fix published").
+   are `[introduced, fixed, severity, ids, publishedDate]` (S7c): the earliest advisory (USN/DSA/DLA) naming the
+   fix, null when no advisory dates it (a CVE record's date is the disclosure, not the fix); the app reads the
+   first 4 (5th optional, for "Fix published").
 
 Alpine (S4, format "apk", keyed by ORIGIN) takes the same pass with these differences:
 1. A range with a not-affected marker (fixed "0" / "0-r0") is dropped whole and counted. Each `introduced` is
@@ -539,7 +540,16 @@ class Candidate:
 
 
 def _date(text):
-    return text[:10] if isinstance(text, str) and re.match(r"^\d{4}-\d{2}-\d{2}", text) else None
+    """The YYYY-MM-DD day of an OSV timestamp, or None. Strict (S7c review L2): ASCII digits and a real calendar
+    day, so the builder never ships a date its own check_release_body refuses (one bad upstream date must not fail
+    a whole release)."""
+    if not isinstance(text, str) or not re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?![0-9])", text):
+        return None
+    try:
+        datetime.date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+    return text[:10]
 
 
 def ingest(zip_path, releases, log):
@@ -1101,13 +1111,16 @@ def severity(release, cve, cand, info):
     return cvss.MEDIUM, "default medium"
 
 
-def release_body(release, rows):
+def release_body(release, rows, date_rows=None):
     """The shipped JSON object (plan 4.1). An rpm file (S5) is COMPACT: keyed by binary rpm name, the fixes are
     shared (one advisory fixes every binary of its source package at one EVR), so the file holds a sorted CVE id
     table `ids`, a fix table `fixes` of `[introduced, fixed, severity, [id index ...], [stream ...]]` sorted by fixed
     EVR (S7c: plus an optional 6th element, the fix's publish date or null), and per binary the sorted indexes of its
     fixes (`pkgs`). A binary's rows are its fixes; the row count is the
-    number of (binary, fix) pairs plus the kernel rows, as for the other formats."""
+    number of (binary, fix) pairs plus the kernel rows, as for the other formats.
+
+    `date_rows` (S7c review L3): the rows a shared rpm fix's date is taken from, the UNPRUNED rows when
+    prune_superseded has dropped some, so pruning one binary's row never moves a fix's date. Default `rows`."""
     apk = release.format == "apk"
     rpm = release.format == "rpm"
     pkgs, kernel = collections.defaultdict(list), collections.defaultdict(list)
@@ -1119,18 +1132,25 @@ def release_body(release, rows):
         elif rpm:
             fix = (row["introduced"], row["fixed"], row["severity"], tuple(row["ids"]), tuple(row.get("streams") or []))
             pkgs[row["source"]].append(fix)
-            # S7c: one fix is shared by every binary naming it, so it takes the EARLIEST date of those binaries'
-            # rows (each already the earliest `published` of its records): the day the fix was first published, as
-            # the kernel rows and the dpkg rows say. A later advisory re-listing the same EVR is not a newer fix.
-            if row["date"] and (fix_date.get(fix) is None or row["date"] < fix_date[fix]):
-                fix_date[fix] = row["date"]
         else:
-            # S7c: the fix's publish date as an OPTIONAL 5th element, by the kernel rows' convention: the row's
-            # `date` (dpkg: the earliest advisory naming this fix, else the earliest record; the candidate already
-            # folded every record naming it to its EARLIEST date, the day the fix was first published), null when
-            # there is none, and always null in an apk file (OSV Alpine has no fix date). The app reads the first 4.
-            pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"],
-                                        None if apk else row["date"]])
+            # S7c: the fix's publish date as an OPTIONAL 5th element (the app reads the first 4), null when unknown
+            # and always null in an apk file (OSV Alpine has no fix date), as the kernel rows. A dpkg row ships
+            # only an ADVISORY date (the earliest USN/DSA/DLA naming this fix: the candidate folded every record
+            # naming it, and the earliest is the day the fix first shipped; a re-issue is not a newer fix). The
+            # fallback record date the intermediates keep is a CVE record's `published`, the CVE's disclosure, not
+            # the fix's (review M1): null instead. Kernel rows keep their own rule above, unchanged.
+            date = row["date"] if not apk and row.get("dateSource") == "advisory" else None
+            pkgs[row["source"]].append([row["introduced"], row["fixed"], row["severity"], row["ids"], date])
+    if rpm:
+        # S7c: one rpm fix is shared by every binary naming it, so it takes the EARLIEST date of those binaries'
+        # rows (each the earliest `published` of the advisories naming it; EL records are all advisories): the day
+        # the fix first shipped. A later advisory re-listing the same EVR is not a newer fix.
+        for row in rows if date_rows is None else date_rows:
+            if row["kernel"] or not row["date"]:
+                continue
+            fix = (row["introduced"], row["fixed"], row["severity"], tuple(row["ids"]), tuple(row.get("streams") or []))
+            if fix_date.get(fix) is None or row["date"] < fix_date[fix]:
+                fix_date[fix] = row["date"]
     fmt = release.format
     body = {"release": release.key, "format": fmt, "keyedBy": _BODY_FORMATS[fmt][0],
             "kernel": {k: sort_rows(v, fmt) for k, v in sorted(kernel.items())}}
@@ -1926,13 +1946,13 @@ def _one_release(release, cands, info, stats, archives, baselines, work, log):
         # S5: fit the cap by keeping fewer superseded fixes per binary (prune_superseded), the most that fits.
         for keep in PRUNE_STEPS:
             pruned, gone = prune_superseded(rows, keep)
-            candidate = body_bytes(release_body(release, pruned))
+            candidate = body_bytes(release_body(release, pruned, date_rows=rows))
             if len(candidate) <= FILE_CAP:
                 log.info(f"{release.key}: {len(data)} bytes is over the {FILE_CAP}-byte cap: kept the newest {keep} "
                          f"fixes per binary and stream, {gone} older superseded rows dropped, {len(candidate)} bytes")
                 counters[f"superseded rows pruned to fit the cap (newest {keep} kept)"] = gone
+                body = release_body(release, pruned, date_rows=rows)
                 rows, data = pruned, candidate
-                body = release_body(release, rows)
                 break
     summary = {k.split(": ", 1)[1]: v for k, v in stats.items() if k.startswith(release.key + ": ")}
     log.info(f"{release.key}: {len(cands)} distinct fixed rows; "

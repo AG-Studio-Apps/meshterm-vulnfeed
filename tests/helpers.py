@@ -62,7 +62,7 @@ def fake_releases(seen=None):
             seen.append(previous)
         release = next(r for r in osvfeed.RELEASES if r.key == "debian-12")
         rows = [{"source": "apt", "introduced": "0", "fixed": "2.6.2", "severity": 3, "ids": ["CVE-2026-109518"],
-                 "kernel": False, "date": "2026-11-04"},
+                 "kernel": False, "date": "2026-11-04", "dateSource": "advisory"},
                 {"source": "linux", "introduced": "0", "fixed": "6.1.158-1", "severity": 4,
                  "ids": ["CVE-2026-1", "CVE-2026-2"], "kernel": True, "date": "2026-10-30"}]
         data = osvfeed.body_bytes(osvfeed.release_body(release, rows))

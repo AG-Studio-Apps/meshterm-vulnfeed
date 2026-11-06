@@ -374,7 +374,8 @@ class SignJobFixDates(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(why, result.stdout)
         for change in (lambda b: self.row(b).append(None), lambda b: (self.row(b).pop(), self.row(b).pop()),
-                       lambda b: b["pkgs"].update(apt="x"), lambda b: b["pkgs"].update(apt=[["0", "1", 3, []][0]])):
+                       lambda b: b["pkgs"].update(apt="x"),               # rows not a list
+                       lambda b: b["pkgs"].update(apt=["0"])):             # a row that is not a list
             with self.subTest(change=change):
                 result = self.check_with(helpers.fake_releases(), "debian-12", change)
                 self.assertNotEqual(result.returncode, 0)

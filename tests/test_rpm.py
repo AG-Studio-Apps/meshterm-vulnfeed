@@ -166,6 +166,10 @@ class IngestAndResolve(unittest.TestCase):
         bad["fixes"][1].append(None)
         with self.assertRaisesRegex(FeedError, "not 5 or 6 fields"):
             osvfeed.check_release_body(bad, "alma-9", entry)
+        # Review L3: after fit-to-cap pruning drops openssl's row, the shared fix keeps the date of the UNPRUNED rows.
+        pruned = [r for r in rows if r["source"] != "openssl"]
+        self.assertEqual(osvfeed.release_body(ALMA, pruned)["fixes"][1][5], "2026-10-01")
+        self.assertEqual(osvfeed.release_body(ALMA, pruned, date_rows=rows)["fixes"][1][5], "2026-09-20")
 
     def test_rhel_cvss_merged_repositories_and_kernel(self):
         rows, counters, decisions, stats, _, _ = self.run_release(RHEL, [

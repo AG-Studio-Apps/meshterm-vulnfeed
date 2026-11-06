@@ -75,10 +75,12 @@ https://ag-studio-apps.github.io/meshterm-vulnfeed/v1/r/<release>-<sha256-16>.js
 
 A package row is `[introduced, fixed, severity, ids, publishedDate]` (severity 3 High, 4 Critical; ids are the
 High/Critical CVEs fixed there); a kernel row is `[introduced, fixed, maxSeverity, count, publishedDate]`.
-`publishedDate` (S7c on package rows) is the day the fix was published, `YYYY-MM-DD` or null when no record dates
-it: the EARLIEST `published` of the advisories (USN/DSA/DLA) naming that fix, else of any record naming it (one row
-folds every record naming the same (source, introduced, fixed), and the earliest is the day the fix first shipped;
-a later advisory re-listing it is not a newer fix). The app reads a package row's first 4 elements, so the 5th is
+`publishedDate` (S7c on package rows) is the day the fix's advisory was published, `YYYY-MM-DD`; null when no
+advisory dates it. It is the EARLIEST `published` of the advisories (USN/DSA/DLA) naming that fix (one row folds
+every record naming the same (source, introduced, fixed), and the earliest is the day the fix first shipped; a
+later advisory re-listing it is not a newer fix). A fix named only by `UBUNTU-CVE-*` / `DEBIAN-CVE-*` records ships
+null: their `published` is the CVE's disclosure, often years before the fix (the intermediates and the golden
+cases still use it as a fallback). Kernel rows keep their own date rule. The app reads a package row's first 4 elements, so the 5th is
 optional: a file built before S7c has 4-element rows and still passes every check. Keyed by SOURCE
 package: hosts match `${source:Package}` / `${source:Version}`.
 
@@ -205,7 +207,8 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
 - **Keyed by BINARY rpm name**: OSV's EL records name binaries (`openssl`, `openssl-libs`, `openssl-devel`) and no
   source rpm, so the file is COMPACT: a sorted CVE table, a fix table sorted by fixed EVR (`[introduced, fixed,
   severity, [id index ...], [module stream ...], publishedDate]`; the date, S7c, is the earliest `published` of the
-  advisories naming that fix for any of its binaries, or null, and the app reads only the first 5 elements) and per
+  advisories naming that fix for any of its binaries (taken before any fit-to-cap pruning), or null, and the app
+  reads only the first 5 elements) and per
   binary the indexes of its fixes. The row count is the
   (binary, fix) pairs plus the kernel rows. The app groups its findings by each binary's SOURCERPM.
 - **Versions** are EVRs compared by `builder/rpmver.py` (rpm-6.1.0 rpmvercmp, its own vectors shared with the app).
@@ -272,8 +275,11 @@ RHEL's next `.el9_N` fix, which is right). Differences from the dpkg rules:
   day its records were CONVERTED to OSV, not the advisory's (RHSA-2003:315 says 2024-09-12), so it is good for the
   "fix older than 7 days" kernel rule and for "before the capture" on a capture-day golden, but never for a backdated
   golden (a `capture` in the past would silently drop every old advisory converted later; review L6). The same date
-  is the fix's `publishedDate` in the file (S7c), so on rhel-* an old fix can read as "published" on its conversion
-  day.
+  is the fix's `publishedDate` in the file (S7c). On **alma-*** it is the ALSA errata's issue date (date-only
+  midnight stamps; every one of the 6,393 records in the 2026-11-05 zip is dated in its id's year or the next). On
+  **rhel-*** it is NOT reliably the errata date: 10,753 of 24,010 records in the same zip carry a 2024 conversion
+  day (RHSA-2019:* dated 2024-09), so an old fix can read as "published" in 2024. It is kept (the kernel rule and
+  ordering still use it); the app does not show a fix date on rhel-* hosts.
 - **Fit to the cap**: a file over 600 KB keeps the newest N fixes per (binary, module stream), the largest N of 16,
   12, 10, 8, 6, 5, 4, 3 that fits. A host below an older fix is below every newer one, so no finding is lost; it lists
   fewer CVEs and can show a lower severity. Logged and counted. None needs it since review H1: rhel-8 was 850 KB with
