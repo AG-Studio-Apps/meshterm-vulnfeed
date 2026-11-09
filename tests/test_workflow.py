@@ -582,3 +582,65 @@ class SignJobRpm(SignJobFormats):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def due_step_script():
+    """The `due` job's run block, dedented as the runner sees it."""
+    lines = open(WORKFLOW, encoding="utf-8").read().split("\n")
+    start = next(i for i, line in enumerate(lines) if "name: Check the live feed's age" in line)
+    first = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
+    body = []
+    for line in lines[first + 1:]:
+        if line.strip() and not line.startswith(" " * 10):
+            break
+        body.append(line)
+    return textwrap.dedent("\n".join(body)) + "\n"
+
+
+class DueJob(unittest.TestCase):
+    """Scheduled runs are only a fallback for the box timer (trigger/): they build when the live feed is
+    FALLBACK_AFTER_HOURS old or unreadable. A dispatch always builds."""
+
+    def run_due(self, event, manifest_body):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            curl = os.path.join(tmp, "curl")
+            with open(curl, "w") as f:
+                if manifest_body is None:
+                    f.write("#!/bin/sh\nexit 22\n")
+                else:
+                    body = os.path.join(tmp, "m.json")
+                    open(body, "w").write(manifest_body)
+                    f.write(f"#!/bin/sh\ncat '{body}'\n")
+            os.chmod(curl, 0o755)
+            out = os.path.join(tmp, "out")
+            open(out, "w").close()
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], EVENT=event, GITHUB_OUTPUT=out,
+                       SITE_URL="https://example.invalid", FALLBACK_AFTER_HOURS="7")
+            subprocess.run(["bash", "-c", due_step_script()], env=env, check=True, capture_output=True)
+            return open(out).read().strip()
+
+    def manifest(self, hours_old):
+        import datetime
+        t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_old)
+        return json.dumps({"generated": t.strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+    def test_dispatch_always_builds(self):
+        self.assertEqual(self.run_due("workflow_dispatch", self.manifest(0.1)), "build=true")
+
+    def test_schedule_skips_a_fresh_feed(self):
+        self.assertEqual(self.run_due("schedule", self.manifest(2)), "build=false")
+        self.assertEqual(self.run_due("schedule", self.manifest(6.9)), "build=false")
+
+    def test_schedule_builds_when_the_box_missed_a_slot(self):
+        self.assertEqual(self.run_due("schedule", self.manifest(7.1)), "build=true")
+
+    def test_schedule_builds_when_unreadable(self):
+        self.assertEqual(self.run_due("schedule", None), "build=true")
+        self.assertEqual(self.run_due("schedule", "not json"), "build=true")
+
+    def test_build_needs_due(self):
+        text = open(WORKFLOW, encoding="utf-8").read()
+        job = text[text.index("\n  build:\n"):text.index("\n  sign:\n")]
+        self.assertIn("needs: due", job)
+        self.assertIn("needs.due.outputs.build == 'true'", job)

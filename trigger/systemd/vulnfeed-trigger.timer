@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the vulnfeed build four times a day
+
+[Timer]
+# 00:20, 06:20, 12:20 and 18:20 UTC (James 2026-11-09). `00,06,12,18:20:00` = those hours at minute 20.
+# No randomized delay: the times are the point. Persistent: a slot missed while the box was off runs at boot.
+OnCalendar=*-*-* 00,06,12,18:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

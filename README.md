@@ -1,7 +1,7 @@
 # meshterm-vulnfeed
 
 The signed host vulnerability feed meshTerm reads for "Security updates" (meshTerm
-`docs/plan-host-cve-scanner.md`). Plain static JSON on GitHub Pages, rebuilt twice a day.
+`docs/plan-host-cve-scanner.md`). Plain static JSON on GitHub Pages, rebuilt four times a day.
 
 **Stages S2 + S4 (this state): curated rules plus OSV release files for dpkg and apk releases.** The manifest
 carries the hand-written Tailscale rules and one release file per Ubuntu / Debian / Alpine release
@@ -389,7 +389,7 @@ so a recipes, catalogue or channel signature never passes as a feed. `date` is t
 
 1. Branch, edit `curated/curated.json`.
 2. `python3 builder/validate_curated.py && python3 -m unittest discover -s tests -t tests`
-3. Pull request for the record, then merge. The next scheduled build (05:10 or 17:10 UTC) publishes it, or run
+3. Pull request for the record, then merge. The next build (00:20, 06:20, 12:20 or 18:20 UTC) publishes it, or run
    `Build vulnfeed` by hand (Actions > Build vulnfeed > Run workflow).
 
 The floors are set by hand. "Recommended" rules never enter the app's pill; they show only in the detail sheet.
@@ -414,7 +414,9 @@ cache from before InRelease verification only has unsigned `Release` files and e
 
 ## The workflow (`.github/workflows/build.yml`)
 
-Schedule 05:10 and 17:10 UTC, plus `workflow_dispatch`. No pull-request trigger. `permissions: {}` by default.
+Builds are `workflow_dispatch` runs fired at 00:20, 06:20, 12:20 and 18:20 UTC by a timer on James's Linux box
+(`trigger/`, install with `bash trigger/install.sh`), because GitHub ran its schedule 3.5 to 8.6 hours late. The
+workflow's own schedule (`40 */2 * * *`) is a fallback: its `due` job builds only when the live feed is over 7 h old. No pull-request trigger. `permissions: {}` by default.
 
 | job | permissions | what |
 |---|---|---|

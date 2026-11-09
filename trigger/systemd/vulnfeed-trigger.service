@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the vulnfeed build (workflow_dispatch)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs the INSTALLED copy (trigger/install.sh), never the working tree.
+ExecStart=%h/.local/lib/vulnfeed-trigger/run.sh
+TimeoutStartSec=120
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin

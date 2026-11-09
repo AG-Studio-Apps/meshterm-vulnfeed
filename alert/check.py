@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """vulnfeed freshness alert: fetches the LIVE manifest and its signature, verifies them against the
 committed public keys, and files ONE private issue in AG-Studio-Apps/meshTerm (label `vulnfeed`) when the
-feed is stale (generated more than 24 h ago) or does not verify. The issue is closed when it recovers.
+feed is stale (generated more than 13 h ago) or does not verify. The issue is closed when it recovers.
 
     check.py run          # what run.sh calls (the systemd timer)
     check.py evaluate     # prints the verdict as JSON; never touches gh
@@ -11,7 +11,7 @@ Environment (all optional):
     VULNFEED_ALERT_URL           site root, default https://ag-studio-apps.github.io/meshterm-vulnfeed
                                  (file:// works, for tests)
     VULNFEED_ALERT_KEYS_DIR      default keys/ beside this file (the installed copy), else the repo's keys/
-    VULNFEED_ALERT_MAX_AGE_HOURS default 24
+    VULNFEED_ALERT_MAX_AGE_HOURS default 13 (two missed 6-hourly builds)
     VULNFEED_ALERT_GH_REPO       default AG-Studio-Apps/meshTerm (a PRIVATE repo, so the issue is private)
     VULNFEED_ALERT_STATE         default $XDG_STATE_HOME/vulnfeed-freshness
     VULNFEED_ALERT_RECORD_URL    where builds/<serial>.json is read, default the COMMITTED record on main
@@ -278,7 +278,7 @@ def main(argv=None, runner=None, now=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
     url = os.environ.get("VULNFEED_ALERT_URL", DEFAULT_URL)
     keys_dir = os.environ.get("VULNFEED_ALERT_KEYS_DIR") or _default_keys_dir()
-    max_age = float(os.environ.get("VULNFEED_ALERT_MAX_AGE_HOURS", "24"))
+    max_age = float(os.environ.get("VULNFEED_ALERT_MAX_AGE_HOURS", "13"))
     record_url = os.environ.get("VULNFEED_ALERT_RECORD_URL") or (DEFAULT_RECORD_URL if url == DEFAULT_URL else None)
     stale_hours = float(os.environ.get("VULNFEED_ALERT_STALE_RELEASE_HOURS", "48"))
     result = evaluate(url, keys_dir, now, max_age, record_url, stale_hours)
