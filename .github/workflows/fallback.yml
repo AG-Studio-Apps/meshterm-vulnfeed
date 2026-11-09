@@ -37,7 +37,7 @@ jobs:
           except Exception:
               print(-1)
           ' || echo -1)
-          case "$age" in ''|*[!0-9-]*) age=-1 ;; esac
+          [[ "$age" =~ ^-?[0-9]+$ ]] || age=-1
           if [ "$age" -lt 0 ] || [ "$age" -ge "$FALLBACK_AFTER_HOURS" ]; then
             echo "Live feed age ${age} h (limit ${FALLBACK_AFTER_HOURS} h, -1 = unreadable): dispatching a build."
             echo "build=true" >> "$GITHUB_OUTPUT"
