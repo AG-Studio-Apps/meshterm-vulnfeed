@@ -416,7 +416,9 @@ cache from before InRelease verification only has unsigned `Release` files and e
 
 Builds are `workflow_dispatch` runs fired at 00:20, 06:20, 12:20 and 18:20 UTC by a timer on James's Linux box
 (`trigger/`, install with `bash trigger/install.sh`), because GitHub ran its schedule 3.5 to 8.6 hours late. The
-workflow's own schedule (`40 */2 * * *`) is a fallback: its `due` job builds only when the live feed is over 7 h old. No pull-request trigger. `permissions: {}` by default.
+build workflow has no schedule. `fallback.yml` runs every 2 h (`40 */2 * * *`) and dispatches a build only
+when the live feed is over 7 h old (the box missed a slot); it holds no concurrency group, so it never displaces a
+pending build. No pull-request trigger. `permissions: {}` by default.
 
 | job | permissions | what |
 |---|---|---|

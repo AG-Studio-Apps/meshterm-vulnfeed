@@ -1,0 +1,52 @@
+# Fallback for the box timer (trigger/): every 2 hours, start a feed build when the live feed is more than
+# FALLBACK_AFTER_HOURS old or unreadable (the box missed a slot). It only dispatches build.yml and holds no
+# concurrency group, so it never displaces a pending build; a dispatched build always builds.
+# No checkout, no repository script, no secrets beyond GITHUB_TOKEN with actions: write (to dispatch).
+name: Build fallback
+
+on:
+  schedule:
+    - cron: "40 */2 * * *"
+
+permissions: {}
+
+env:
+  SITE_URL: https://ag-studio-apps.github.io/meshterm-vulnfeed
+  FALLBACK_AFTER_HOURS: "7"
+
+jobs:
+  due:
+    name: Dispatch a build when the feed is stale
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Check the live feed's age
+        id: due
+        run: |
+          set -u
+          m=$(curl -fsS --max-time 30 -H 'Cache-Control: no-cache' "$SITE_URL/v1/manifest.json?r=$(date +%s)$RANDOM" || true)
+          age=$(printf '%s' "$m" | python3 -I -c '
+          import datetime, json, sys
+          try:
+              g = json.load(sys.stdin)["generated"]
+              t = datetime.datetime.fromisoformat(g.replace("Z", "+00:00"))
+              print(int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() // 3600))
+          except Exception:
+              print(-1)
+          ' || echo -1)
+          case "$age" in ''|*[!0-9-]*) age=-1 ;; esac
+          if [ "$age" -lt 0 ] || [ "$age" -ge "$FALLBACK_AFTER_HOURS" ]; then
+            echo "Live feed age ${age} h (limit ${FALLBACK_AFTER_HOURS} h, -1 = unreadable): dispatching a build."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Live feed is ${age} h old: the box timer is keeping it fresh, nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Dispatch the build
+        if: steps.due.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml -R "$GITHUB_REPOSITORY" --ref main

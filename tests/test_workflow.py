@@ -15,6 +15,7 @@ import build
 import osvfeed
 
 WORKFLOW = os.path.join(helpers.ROOT, ".github", "workflows", "build.yml")
+FALLBACK = os.path.join(helpers.ROOT, ".github", "workflows", "fallback.yml")
 NOW = "2026-11-05T05:10:00Z"
 
 
@@ -580,13 +581,9 @@ class SignJobRpm(SignJobFormats):
                          ["rpm", "rpm", "apk", "dpkg"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def due_step_script():
     """The `due` job's run block, dedented as the runner sees it."""
-    lines = open(WORKFLOW, encoding="utf-8").read().split("\n")
+    lines = open(FALLBACK, encoding="utf-8").read().split("\n")
     start = next(i for i, line in enumerate(lines) if "name: Check the live feed's age" in line)
     first = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
     body = []
@@ -597,11 +594,10 @@ def due_step_script():
     return textwrap.dedent("\n".join(body)) + "\n"
 
 
-class DueJob(unittest.TestCase):
-    """Scheduled runs are only a fallback for the box timer (trigger/): they build when the live feed is
-    FALLBACK_AFTER_HOURS old or unreadable. A dispatch always builds."""
+class FallbackJob(unittest.TestCase):
+    """fallback.yml dispatches a build only when the live feed is FALLBACK_AFTER_HOURS old or unreadable."""
 
-    def run_due(self, event, manifest_body):
+    def run_due(self, manifest_body):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             curl = os.path.join(tmp, "curl")
@@ -615,7 +611,7 @@ class DueJob(unittest.TestCase):
             os.chmod(curl, 0o755)
             out = os.path.join(tmp, "out")
             open(out, "w").close()
-            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], EVENT=event, GITHUB_OUTPUT=out,
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], GITHUB_OUTPUT=out,
                        SITE_URL="https://example.invalid", FALLBACK_AFTER_HOURS="7")
             subprocess.run(["bash", "-c", due_step_script()], env=env, check=True, capture_output=True)
             return open(out).read().strip()
@@ -625,22 +621,28 @@ class DueJob(unittest.TestCase):
         t = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours_old)
         return json.dumps({"generated": t.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
-    def test_dispatch_always_builds(self):
-        self.assertEqual(self.run_due("workflow_dispatch", self.manifest(0.1)), "build=true")
-
     def test_schedule_skips_a_fresh_feed(self):
-        self.assertEqual(self.run_due("schedule", self.manifest(2)), "build=false")
-        self.assertEqual(self.run_due("schedule", self.manifest(6.9)), "build=false")
+        self.assertEqual(self.run_due(self.manifest(2)), "build=false")
+        self.assertEqual(self.run_due(self.manifest(6.9)), "build=false")
 
     def test_schedule_builds_when_the_box_missed_a_slot(self):
-        self.assertEqual(self.run_due("schedule", self.manifest(7.1)), "build=true")
+        self.assertEqual(self.run_due(self.manifest(7.1)), "build=true")
 
     def test_schedule_builds_when_unreadable(self):
-        self.assertEqual(self.run_due("schedule", None), "build=true")
-        self.assertEqual(self.run_due("schedule", "not json"), "build=true")
+        self.assertEqual(self.run_due(None), "build=true")
+        self.assertEqual(self.run_due("not json"), "build=true")
 
-    def test_build_needs_due(self):
-        text = open(WORKFLOW, encoding="utf-8").read()
-        job = text[text.index("\n  build:\n"):text.index("\n  sign:\n")]
-        self.assertIn("needs: due", job)
-        self.assertIn("needs.due.outputs.build == 'true'", job)
+    def test_missing_field_or_future_time_builds(self):
+        self.assertEqual(self.run_due(json.dumps({"serial": 1})), "build=true")
+        self.assertEqual(self.run_due(self.manifest(-3)), "build=true")
+
+    def test_build_has_no_schedule_and_fallback_holds_no_group(self):
+        build_yml = open(WORKFLOW, encoding="utf-8").read()
+        on = build_yml[build_yml.index("\non:\n"):build_yml.index("\npermissions:")]
+        self.assertNotIn("schedule", on)
+        fallback = open(FALLBACK, encoding="utf-8").read()
+        self.assertNotIn("\nconcurrency:", fallback)
+        self.assertIn("gh workflow run build.yml", fallback)
+
+if __name__ == "__main__":
+    unittest.main()

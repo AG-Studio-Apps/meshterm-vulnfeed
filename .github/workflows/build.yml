@@ -31,14 +31,12 @@
 # freshness alert's installed keys (alert/install.sh copies keys/), and the app's pinned keys (VulnFeedTrust).
 name: Build vulnfeed
 
-# Timing: the builds that matter are workflow_dispatch runs fired by a timer on James's Linux box at 00:20, 06:20,
-# 12:20 and 18:20 UTC (trigger/, James 2026-11-09). GitHub runs dispatches at once, while its schedule ran 3.5 to
-# 8.6 hours late (2026-11-05..09). The schedule below is only the fallback: the `due` job lets a scheduled run
-# build only when the live feed is more than FALLBACK_AFTER_HOURS old (the box missed a slot), so the two never
-# double up. A dispatch always builds.
+# Timing: builds are workflow_dispatch runs only. A timer on James's Linux box fires them at 00:20, 06:20, 12:20
+# and 18:20 UTC (trigger/, James 2026-11-09): GitHub runs a dispatch at once, while its schedule ran 3.5 to 8.6
+# hours late (2026-11-05..09). fallback.yml (scheduled, outside this concurrency group) dispatches a build when
+# the live feed is over 7 h old, i.e. the box missed a slot. No schedule here: a queued scheduled run could
+# replace a pending dispatch in the group below and then decline to build.
 on:
-  schedule:
-    - cron: "40 */2 * * *"
   workflow_dispatch:
 
 permissions: {}
@@ -51,49 +49,11 @@ env:
   SITE_URL: https://ag-studio-apps.github.io/meshterm-vulnfeed
   FEED_KEY_ID: 965BA616AC0D4DFC
   EMERGENCY_KEY_ID: 299EE7D96076CF7D
-  FALLBACK_AFTER_HOURS: "7"
 
 jobs:
-  due:
-    name: Decide whether to build
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions: {}
-    outputs:
-      build: ${{ steps.due.outputs.build }}
-    steps:
-      # No checkout, no repository script. A dispatch always builds. A scheduled run builds when the live
-      # manifest is older than FALLBACK_AFTER_HOURS, or cannot be read or parsed (fail towards building).
-      - name: Check the live feed's age
-        id: due
-        env:
-          EVENT: ${{ github.event_name }}
-        run: |
-          set -u
-          if [ "$EVENT" != "schedule" ]; then echo "build=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          m=$(curl -fsS --max-time 30 -H 'Cache-Control: no-cache' "$SITE_URL/v1/manifest.json?r=$(date +%s)$RANDOM" || true)
-          age=$(printf '%s' "$m" | python3 -I -c '
-          import datetime, json, sys
-          try:
-              g = json.load(sys.stdin)["generated"]
-              t = datetime.datetime.fromisoformat(g.replace("Z", "+00:00"))
-              print(int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds() // 3600))
-          except Exception:
-              print(-1)
-          ')
-          if [ "$age" -lt 0 ] || [ "$age" -ge "$FALLBACK_AFTER_HOURS" ]; then
-            echo "Live feed age ${age} h (limit ${FALLBACK_AFTER_HOURS} h, -1 = unreadable): fallback build."
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Live feed is ${age} h old: the box timer is keeping it fresh, nothing to do."
-            echo "build=false" >> "$GITHUB_OUTPUT"
-          fi
-
   build:
     name: Build and gate
-    needs: due
-    if: github.ref == 'refs/heads/main' && needs.due.outputs.build == 'true'
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     # S2: about 1 GB of OSV zips plus the archive Sources, and a 3 to 5 minute single read of Ubuntu's 8 GB
     # export. 45 minutes leaves room for slow mirrors and the download retries.
